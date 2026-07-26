@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kalshi-trading-bot (v0.1.2)
+kalshi-trading-bot (v0.2.0)
 ===========================
 Automated trading bot for Kalshi 15-minute crypto up/down markets
 (default: BTC, series KXBTC15M).
@@ -27,6 +27,20 @@ MODES:
   - Set FORCE_PAPER_MODE = True to override and always paper-trade.
 
 CHANGELOG:
+  v0.2.0 (2026-07-27):
+    - NEW: Multi-Timeframe Momentum (MTF) engine. Evaluates 1d / 4h / 1h /
+      15m / 5m klines (RSI + recent return + candle direction) into a
+      weighted composite score in [-1, +1] with an UP/DOWN/NEUTRAL bias.
+    - NEW: Counter-trend gate — delta_capture entries fighting the MTF bias
+      are blocked (configurable via MTF_COUNTER_TREND_BLOCK).
+    - NEW: Trend-aligned continuation entries. When MTF score >=
+      MTF_STRONG_SCORE on the delta side, the max-delta cap relaxes to
+      MTF_TREND_MAX_DELTA_PCT and the StochRSI dead-zone check is waived,
+      so strong-trend windows (previously skipped for delta > 0.10%) trade.
+    - NEW: Trend windows (delta beyond the relaxed cap, MTF strong) can enter
+      at up to MTF_TREND_MAX_PRICE with reduced size (MTF_TREND_SIZE_MULT).
+    - MTF score/bias added to ENTRY log lines and the terminal dashboard.
+      Set MTF_ENABLED = False to restore exact v0.1.2 behavior.
   v0.1.2 (2026-07-27):
     - FIX: delta_capture no longer force-sells in the final minute. FORCED_CLOSE
       (aggressive, floor-priced) now applies to legacy strategies only; DC
@@ -119,6 +133,29 @@ DC_SALVAGE_EXIT = True            # If delta flips sign with >5 min left, sell t
 DC_SALVAGE_MIN_MINUTES = 5.0      # ...only if at least this many minutes remain
 DC_SALVAGE_MIN_FLIP_PCT = 0.0002  # ...and the flipped delta exceeds this (~0.02%)
 DC_SALVAGE_MIN_HOLD_S = 60        # ...and the position has been held this long
+
+# --- Multi-Timeframe Momentum (MTF) engine — v0.2.0 ---
+# Evaluates higher timeframes and blends them into one score in [-1, +1].
+# Positive = upward momentum, negative = downward. Used to (a) block
+# counter-trend entries and (b) unlock trend-aligned continuation entries
+# that the plain delta cap (0.10%) would otherwise skip.
+MTF_ENABLED = True                # False = exact v0.1.2 behavior
+MTF_TIMEFRAMES = {                # timeframe -> (Binance interval, weight, klines to fetch)
+    "1d":  ("1d",  0.30, 30),
+    "4h":  ("4h",  0.25, 30),
+    "1h":  ("1h",  0.20, 30),
+    "15m": ("15m", 0.15, 30),
+    "5m":  ("5m",  0.10, 30),
+}
+MTF_RSI_LEN = 14                  # RSI period per timeframe
+MTF_RET_BARS = 3                  # Return measured over last N closed bars
+MTF_CACHE_TTL_S = 120             # Higher-TF data refreshes at most this often
+MTF_COUNTER_TREND_BLOCK = True    # Block entries against the MTF bias
+MTF_MIN_SCORE = 0.15              # |score| below this = NEUTRAL (no bias enforced)
+MTF_STRONG_SCORE = 0.45           # >= this = strong trend; relaxes delta cap + dead zone
+MTF_TREND_MAX_DELTA_PCT = 0.0025  # Trend-aligned entries allowed up to 0.25% delta
+MTF_TREND_MAX_PRICE = 0.75        # Trend continuation entries may pay up to 75c
+MTF_TREND_SIZE_MULT = 0.5         # Continuation entries trade at reduced size
 
 # --- StochRSI indicator settings (1-minute closes) ---
 RSI_LEN = 14                      # RSI period
@@ -524,6 +561,58 @@ class PriceFeed:
         except Exception:
             return self._kline_cache.get(key, (0, []))[1]
 
+    # --- Multi-Timeframe Momentum (v0.2.0) ---
+    def _fetch_klines(self, interval: str, limit: int) -> List[list]:
+        """Generic Binance kline fetch, cached MTF_CACHE_TTL_S per interval."""
+        key = f"mtf:{interval}:{limit}"
+        now = time.time()
+        if key in self._kline_cache and now - self._kline_cache[key][0] < MTF_CACHE_TTL_S:
+            return self._kline_cache[key][1]
+        try:
+            r = self.session.get(self.BINANCE_URL,
+                                 params={"symbol": self.binance_symbol,
+                                         "interval": interval, "limit": limit},
+                                 timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            self._kline_cache[key] = (now, data)
+            return data
+        except Exception as e:
+            logging.getLogger("kalshi_bot").debug(f"MTF kline fetch {interval} failed: {e}")
+            return self._kline_cache.get(key, (0, []))[1]
+
+    def momentum_score(self) -> Tuple[float, str, str]:
+        """Weighted multi-timeframe momentum.
+        Returns (score in [-1,+1], bias 'UP'/'DOWN'/'NEUTRAL', detail string).
+        Each timeframe contributes: RSI tilt ((RSI-50)/50) + recent-return tilt
+        (capped at +/-0.5) + last-candle direction, averaged, then blended by
+        MTF_TIMEFRAMES weights. Timeframes that fail to fetch are skipped and
+        the remaining weights renormalize, so partial outages degrade gently."""
+        if not MTF_ENABLED:
+            return 0.0, "NEUTRAL", "off"
+        total_w, total_v, parts = 0.0, 0.0, []
+        for tf, (interval, weight, limit) in MTF_TIMEFRAMES.items():
+            kl = self._fetch_klines(interval, limit)
+            if not kl or len(kl) < MTF_RSI_LEN + MTF_RET_BARS + 2:
+                continue
+            closes = [float(k[4]) for k in kl[:-1]] or [float(k[4]) for k in kl]  # closed bars only
+            if len(closes) < MTF_RSI_LEN + MTF_RET_BARS + 1:
+                continue
+            rsi = self.rsi_series(closes, MTF_RSI_LEN)
+            rsi_tilt = max(-1.0, min(1.0, (rsi[-1] - 50.0) / 50.0))
+            ret = (closes[-1] - closes[-1 - MTF_RET_BARS]) / closes[-1 - MTF_RET_BARS]
+            ret_tilt = max(-1.0, min(1.0, ret / 0.005))  # 0.5% move = full tilt
+            candle_dir = 1.0 if closes[-1] > float(kl[-2][1]) else (-1.0 if closes[-1] < float(kl[-2][1]) else 0.0)
+            tf_score = (rsi_tilt + ret_tilt + candle_dir) / 3.0
+            total_w += weight
+            total_v += weight * tf_score
+            parts.append(f"{tf}:{tf_score:+.2f}")
+        if total_w <= 0:
+            return 0.0, "NEUTRAL", "no-data"
+        score = total_v / total_w
+        bias = "UP" if score >= MTF_MIN_SCORE else ("DOWN" if score <= -MTF_MIN_SCORE else "NEUTRAL")
+        return score, bias, " ".join(parts)
+
     # --- Indicator math (1m closes) ---
     @staticmethod
     def rsi_series(closes: List[float], period: int) -> List[float]:
@@ -607,43 +696,81 @@ class StrategyEngine:
     def __init__(self, feed: PriceFeed):
         self.feed = feed
 
-    # --- DEFAULT: Delta Capture + StochRSI Confirm ---
+    # --- DEFAULT: Delta Capture + StochRSI Confirm (+ MTF filter, v0.2.0) ---
     def delta_capture(self, price: float, strike: float, mins_left: float,
-                      ask_up: float, ask_down: float, spread_cents: float) -> Optional[EntryDecision]:
+                      ask_up: float, ask_down: float, spread_cents: float,
+                      mtf: Tuple[float, str, str] = (0.0, "NEUTRAL", "off")) -> Optional[EntryDecision]:
         k, d = self.feed.stoch_rsi_kd()
         atr = self.feed.atr_pct()
+        mtf_score, mtf_bias, mtf_detail = mtf
 
-        # No-trade gates (apply to both entries and the scalp variant)
+        # No-trade gates (apply to all entry variants)
         if atr > DC_ATR_MAX_PCT:
             return None                                   # Burst volatility / whipsaw
         if spread_cents > DC_MAX_SPREAD_CENTS:
             return None                                   # Spread too wide
-        if DC_DEAD_ZONE[0] <= k <= DC_DEAD_ZONE[1]:
-            return None                                   # StochRSI dead zone
 
         delta = (price - strike) / strike if strike > 0 else 0.0
 
+        # MTF counter-trend gate: don't buy the side the higher timeframes oppose
+        def fights_trend(side: str) -> bool:
+            return (MTF_ENABLED and MTF_COUNTER_TREND_BLOCK
+                    and mtf_bias in ("UP", "DOWN") and side != mtf_bias)
+
+        # MTF trend strength relaxers
+        strong_up = MTF_ENABLED and mtf_score >= MTF_STRONG_SCORE
+        strong_down = MTF_ENABLED and mtf_score <= -MTF_STRONG_SCORE
+        in_dead_zone = DC_DEAD_ZONE[0] <= k <= DC_DEAD_ZONE[1]
+
         # Momentum scalp variant: minutes 1-3 of window, price already moving
         if DC_SCALP_ENABLED and DC_SCALP_WINDOW_MIN[0] <= mins_left <= DC_SCALP_WINDOW_MIN[1]:
+            if in_dead_zone and not (strong_up or strong_down):
+                return None
             if abs(delta) >= DC_SCALP_MIN_MOVE_PCT and abs(delta) <= DC_MAX_DELTA_PCT:
-                if delta > 0 and k > DC_SCALP_K_UP and k >= d and ask_up <= DC_SCALP_MAX_PRICE:
-                    return EntryDecision("UP", f"scalp delta={delta:.4%} K={k:.0f}", DC_SCALP_SIZE_MULT)
-                if delta < 0 and k < DC_SCALP_K_DOWN and k <= d and ask_down <= DC_SCALP_MAX_PRICE:
-                    return EntryDecision("DOWN", f"scalp delta={delta:.4%} K={k:.0f}", DC_SCALP_SIZE_MULT)
+                if (delta > 0 and k > DC_SCALP_K_UP and k >= d and ask_up <= DC_SCALP_MAX_PRICE
+                        and not fights_trend("UP")):
+                    return EntryDecision("UP", f"scalp delta={delta:.4%} K={k:.0f} mtf={mtf_score:+.2f}", DC_SCALP_SIZE_MULT)
+                if (delta < 0 and k < DC_SCALP_K_DOWN and k <= d and ask_down <= DC_SCALP_MAX_PRICE
+                        and not fights_trend("DOWN")):
+                    return EntryDecision("DOWN", f"scalp delta={delta:.4%} K={k:.0f} mtf={mtf_score:+.2f}", DC_SCALP_SIZE_MULT)
             return None  # Outside scalp conditions in early window = no trade
 
         # Core entry: 3-8 minutes remaining
         lo, hi = DC_ENTRY_WINDOW_MIN
         if not (lo <= mins_left <= hi):
             return None
-        if abs(delta) > DC_MAX_DELTA_PCT or abs(delta) < DC_MIN_DELTA_PCT:
+        if abs(delta) < DC_MIN_DELTA_PCT:
             return None
-        if delta >= DC_MIN_DELTA_PCT and k > DC_STOCH_K_LONG_MIN and (not DC_REQUIRE_K_GT_D or k >= d):
-            if ask_up <= DC_MAX_ENTRY_PRICE:
-                return EntryDecision("UP", f"delta={delta:.4%} K={k:.0f}>=D={d:.0f} ask={ask_up:.2f}")
-        if delta <= -DC_MIN_DELTA_PCT and k < (100 - DC_STOCH_K_LONG_MIN) and (not DC_REQUIRE_K_GT_D or k <= d):
-            if ask_down <= DC_MAX_ENTRY_PRICE:
-                return EntryDecision("DOWN", f"delta={delta:.4%} K={k:.0f}<D={d:.0f} ask={ask_down:.2f}")
+
+        # Trend-aligned relaxation: with a strong MTF tailwind the delta cap
+        # widens (0.10% -> MTF_TREND_MAX_DELTA_PCT) and the StochRSI dead zone
+        # is waived. Counter-trend entries keep the strict 0.10% cap.
+        max_delta_up = MTF_TREND_MAX_DELTA_PCT if strong_up else DC_MAX_DELTA_PCT
+        max_delta_down = MTF_TREND_MAX_DELTA_PCT if strong_down else DC_MAX_DELTA_PCT
+
+        # UP core entry
+        if delta >= DC_MIN_DELTA_PCT and delta <= max_delta_up and not fights_trend("UP"):
+            k_ok = (k > DC_STOCH_K_LONG_MIN and (not DC_REQUIRE_K_GT_D or k >= d)) and not in_dead_zone
+            k_ok = k_ok or (strong_up and k > DC_DEAD_ZONE[0])  # trend override: K just needs to lean up
+            relaxed = delta > DC_MAX_DELTA_PCT or (in_dead_zone and strong_up)
+            price_cap = MTF_TREND_MAX_PRICE if relaxed else DC_MAX_ENTRY_PRICE
+            if k_ok and ask_up <= price_cap:
+                mult = MTF_TREND_SIZE_MULT if relaxed else 1.0
+                tag = "trend" if relaxed else "core"
+                return EntryDecision("UP", f"{tag} delta={delta:.4%} K={k:.0f}>=D={d:.0f} "
+                                           f"ask={ask_up:.2f} mtf={mtf_score:+.2f}[{mtf_detail}]", mult)
+
+        # DOWN core entry
+        if delta <= -DC_MIN_DELTA_PCT and delta >= -max_delta_down and not fights_trend("DOWN"):
+            k_ok = (k < (100 - DC_STOCH_K_LONG_MIN) and (not DC_REQUIRE_K_GT_D or k <= d)) and not in_dead_zone
+            k_ok = k_ok or (strong_down and k < DC_DEAD_ZONE[1])  # trend override: K just needs to lean down
+            relaxed = abs(delta) > DC_MAX_DELTA_PCT or (in_dead_zone and strong_down)
+            price_cap = MTF_TREND_MAX_PRICE if relaxed else DC_MAX_ENTRY_PRICE
+            if k_ok and ask_down <= price_cap:
+                mult = MTF_TREND_SIZE_MULT if relaxed else 1.0
+                tag = "trend" if relaxed else "core"
+                return EntryDecision("DOWN", f"{tag} delta={delta:.4%} K={k:.0f}<D={d:.0f} "
+                                             f"ask={ask_down:.2f} mtf={mtf_score:+.2f}[{mtf_detail}]", mult)
         return None
 
     # --- LEGACY strategies (15m klines) ---
@@ -1114,9 +1241,13 @@ class KalshiTradingBot:
         if use_dc:
             if price <= 0 or not strike:
                 return
+            mtf = self.feeds[asset].momentum_score()
             decision = self.engines[asset].delta_capture(
                 price, strike, mins_left, snap["up_ask"] or snap["up"],
-                snap["down_ask"] or snap["down"], spread * 100)
+                snap["down_ask"] or snap["down"], spread * 100, mtf=mtf)
+            if decision is None and mtf[1] in ("UP", "DOWN"):
+                self.log_once(f"{asset}|MTFBLK{snap['ticker']}",
+                              f"{asset} no entry | MTF {mtf[1]} score {mtf[0]:+.2f} ({mtf[2]})")
         else:
             # Legacy strategies: require contract to be a strong favorite first
             decision = self.engines[asset].legacy_signal(STRATEGY)
@@ -1337,6 +1468,7 @@ class KalshiTradingBot:
             lines.append(f"|  {asset:<4} {st.phase:<14} {d.get('ticker','-')[:24]:<24} {pos_line:<18}|"[:width+1] + "|")
             lines.append(f"|    UP:{d.get('up',0):.2f} DN:{d.get('down',0):.2f} px:{d.get('price',0):.0f} "
                          f"K:{d.get('k',0):.0f} D:{d.get('d',0):.0f} d:{d.get('delta',0):+.4%} left:{d.get('mins',0):.1f}m"[:width+1] + "|")
+            lines.append(f"|    MTF:{d.get('mtf',0):+.2f} bias:{d.get('mtf_bias','-'):<8}"[:width+1] + "|")
             lines.append("+" + "-" * width + "+")
         esc = chr(27)
         sys.stdout.write(esc + "[2J" + esc + "[H" + chr(10).join(lines) + chr(10))
@@ -1355,12 +1487,17 @@ class KalshiTradingBot:
     # ------------------------------ run loop ------------------------------
     def run(self):
         self.log("=" * 60)
-        self.log(f"kalshi-trading-bot v0.1.0 | Strategy: {STRATEGY}")
+        self.log(f"kalshi-trading-bot v0.2.0 | Strategy: {STRATEGY}")
         self.log(f"Mode: {'LIVE ORDERS' if self.live_orders else 'PAPER/TEST'} | Assets: {ASSETS}")
         self.log(f"Delta Capture: window {DC_ENTRY_WINDOW_MIN}m | delta {DC_MIN_DELTA_PCT:.4%}-{DC_MAX_DELTA_PCT:.4%} "
                  f"| max entry ${DC_MAX_ENTRY_PRICE} | ATR cap {DC_ATR_MAX_PCT:.4%} | spread cap {DC_MAX_SPREAD_CENTS}c")
         self.log(f"Risk: daily loss ${MAX_DAILY_LOSS} | drawdown {MAX_DRAWDOWN_PERCENT}% | "
                  f"{MAX_CONSECUTIVE_LOSSES} straight losses -> {PAUSE_AFTER_LOSS_STREAK_MIN}m pause | size cap {MAX_ORDER_SIZE}")
+        if MTF_ENABLED:
+            tfs = "/".join(MTF_TIMEFRAMES.keys())
+            self.log(f"MTF momentum: {tfs} | block counter-trend: {MTF_COUNTER_TREND_BLOCK} | "
+                     f"strong >= {MTF_STRONG_SCORE} (delta cap {MTF_TREND_MAX_DELTA_PCT:.4%}, max ${MTF_TREND_MAX_PRICE}, "
+                     f"size x{MTF_TREND_SIZE_MULT})")
         self.log("=" * 60)
         try:
             while self.running:
@@ -1410,9 +1547,11 @@ class KalshiTradingBot:
                         with self._display_lock:
                             k, d = self.feeds[asset].stoch_rsi_kd()
                             delta = ((price - strike) / strike) if (strike and price > 0) else 0.0
+                            mtf = self.feeds[asset].momentum_score()
                             self.display_data[asset] = {
                                 "ticker": snap["ticker"], "up": snap["up"], "down": snap["down"],
-                                "price": price, "k": k, "d": d, "delta": delta, "mins": snap["minutes_left"]}
+                                "price": price, "k": k, "d": d, "delta": delta, "mins": snap["minutes_left"],
+                                "mtf": mtf[0], "mtf_bias": mtf[1]}
                     time.sleep(POLL_INTERVAL_MONITORING_S if any_active or self.positions else POLL_INTERVAL_RELAXED_S)
                 except Exception as e:
                     self.log(f"Loop error: {e}", logging.ERROR)
@@ -1456,7 +1595,7 @@ def load_api_keys_from_dir() -> Tuple[str, str]:
 
 def main():
     global PRETTY_DISPLAY
-    parser = argparse.ArgumentParser(description="kalshi-trading-bot v0.1.0")
+    parser = argparse.ArgumentParser(description="kalshi-trading-bot v0.2.0")
     parser.add_argument("--paper", action="store_true", help="Force paper/test mode")
     parser.add_argument("--pretty", action="store_true", help="Live terminal dashboard")
     args = parser.parse_args()
