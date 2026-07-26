@@ -2,7 +2,7 @@
 
 Automated trading bot for Kalshi 15-minute crypto up/down markets (default: BTC, series `KXBTC15M`).
 
-**Version:** 0.1.2 (2026-07-27)
+**Version:** 0.2.0 (2026-07-27)
 
 ## Overview
 
