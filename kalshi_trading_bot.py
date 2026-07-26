@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kalshi-trading-bot (v0.1.0)
+kalshi-trading-bot (v0.1.2)
 ===========================
 Automated trading bot for Kalshi 15-minute crypto up/down markets
 (default: BTC, series KXBTC15M).
@@ -27,6 +27,30 @@ MODES:
   - Set FORCE_PAPER_MODE = True to override and always paper-trade.
 
 CHANGELOG:
+  v0.1.2 (2026-07-27):
+    - FIX: delta_capture no longer force-sells in the final minute. FORCED_CLOSE
+      (aggressive, floor-priced) now applies to legacy strategies only; DC
+      positions ride to settlement and are resolved via the market result.
+    - FIX: salvage exit hair-trigger. A delta flip now requires (a) the flipped
+      delta to exceed DC_SALVAGE_MIN_FLIP_PCT and (b) a minimum hold of
+      DC_SALVAGE_MIN_HOLD_S, so a 20-second wobble can't dump a fresh entry.
+    - FIX: _get_balance() cents heuristic could halve real balances > $100.
+      Now prefers the balance_dollars field and only divides when the value
+      is implausibly large for a dollar figure (> $100,000).
+    - Added settlement resolution when the window expires but the ticker has
+      not rolled yet (mins_left <= 0.25), using the market result API.
+    - Parenthesized side-select expressions in evaluate_entry/manage_position
+      to remove reliance on or/ternary operator precedence.
+    - IN POSITION log line now includes the captured strike.
+  v0.1.1 (2026-07-26):
+    - FIX: paper-mode exits no longer record $0.00. close_position() previously
+      bailed out on has_existing_position() (always False without API keys)
+      BEFORE the paper-mode branch, so every paper exit was booked as a total
+      loss — including PROFIT_TARGET wins. Paper exits now use the live
+      contract price passed from manage_position().
+    - FIX: window-roll settlement no longer checks the NEW window's price.
+      Settlement is resolved from the OLD ticker's market result via the API,
+      with price-vs-strike fallback using the strike captured at entry.
   v0.1.0 (2026-07-26):
     - Project renamed to kalshi-trading-bot (all legacy branding removed).
     - Config file removed; all settings are variables at the top of this file.
@@ -93,6 +117,8 @@ DC_SCALP_K_DOWN = 40.0            # Scalp DOWN: K below this
 DC_SCALP_SIZE_MULT = 0.5          # Scalp trades at half size
 DC_SALVAGE_EXIT = True            # If delta flips sign with >5 min left, sell to cut loss
 DC_SALVAGE_MIN_MINUTES = 5.0      # ...only if at least this many minutes remain
+DC_SALVAGE_MIN_FLIP_PCT = 0.0002  # ...and the flipped delta exceeds this (~0.02%)
+DC_SALVAGE_MIN_HOLD_S = 60        # ...and the position has been held this long
 
 # --- StochRSI indicator settings (1-minute closes) ---
 RSI_LEN = 14                      # RSI period
@@ -338,6 +364,12 @@ class KalshiAPI:
                          params={"series_ticker": series_ticker, "status": status, "limit": limit},
                          authenticated=False)
         return r.get("data", {}).get("markets", [])
+
+    def get_market(self, ticker: str) -> dict:
+        """Single-market lookup (used to resolve settlement of a closed window)."""
+        r = self.request("GET", f"/trade-api/v2/markets/{ticker}", authenticated=False)
+        data = r.get("data", {})
+        return data.get("market", data) if isinstance(data, dict) else {}
 
     def get_orderbook(self, ticker: str, depth: int = 3) -> dict:
         r = self.request("GET", f"/trade-api/v2/markets/{ticker}/orderbook",
@@ -673,6 +705,7 @@ class Position:
     entry_time: datetime
     entry_order_id: str = ""
     strategy: str = ""
+    strike: float = 0.0
     max_pnl: float = 0.0
     stop_loss: float = 0.0
     highest_price: float = 0.0
@@ -824,9 +857,13 @@ class KalshiTradingBot:
         if now - ts < BALANCE_CACHE_TTL_S and ts > 0:
             return bal
         r = self.api.get_balance()
-        bal = self._safe_float(r.get("data", {}).get("balance", 0)) if r.get("status") == 200 else 0.0
-        if bal > 100:  # some API versions return cents
-            bal /= 100.0
+        data = r.get("data", {}) if r.get("status") == 200 else {}
+        # Prefer the explicit dollars field; fall back to legacy "balance"
+        bal = self._safe_float(data.get("balance_dollars", 0))
+        if bal <= 0:
+            bal = self._safe_float(data.get("balance", 0))
+            if bal > 100000:  # implausibly large for dollars -> treat as cents
+                bal /= 100.0
         self._balance_cache = (bal, now)
         return bal
 
@@ -935,22 +972,30 @@ class KalshiTradingBot:
             return (ticker if self.has_existing_position(ticker, force=True) else None), cents / 100.0
         return order_id, cents / 100.0
 
-    def close_position(self, asset: str, reason: str, aggressive: bool = False) -> Tuple[bool, float]:
+    def close_position(self, asset: str, reason: str, aggressive: bool = False,
+                       paper_price: float = 0.0) -> Tuple[bool, float]:
         pos = self.positions.get(asset)
         if not pos:
             return True, 0.0
+        floor = EMERGENCY_EXIT_PRICE if aggressive else STOP_LOSS_FLOOR_PRICE
+        # Paper mode: no real position exists, so skip account checks entirely
+        # and book the exit at the live contract price (or best bid - buffer).
+        if not self.live_orders:
+            exit_price = paper_price
+            if exit_price <= 0:
+                yes_bid, _, no_bid, _ = self._orderbook_best(pos.ticker)
+                bid = yes_bid if pos.side == "UP" else no_bid
+                exit_price = max(bid - FILL_BUFFER, floor) if bid > 0 else floor
+            return True, exit_price
         self._pos_cache.pop(pos.ticker, None)
         if not self.has_existing_position(pos.ticker):
             return True, 0.0
-        floor = EMERGENCY_EXIT_PRICE if aggressive else STOP_LOSS_FLOOR_PRICE
         for attempt in range(6):
             yes_bid, _, no_bid, _ = self._orderbook_best(pos.ticker)
             bid = yes_bid if pos.side == "UP" else no_bid
             exit_price = max(bid - FILL_BUFFER, floor) if bid > 0 else floor
             if attempt >= 3:
                 exit_price = floor  # marketable limit to guarantee fill
-            if not self.live_orders:
-                return True, exit_price
             cents = max(1, min(99, int(round(exit_price * 100))))
             result = self.api.place_order(ticker=pos.ticker, action="sell",
                                           side="yes" if pos.side == "UP" else "no",
@@ -1115,7 +1160,7 @@ class KalshiTradingBot:
             self.log_once(f"{asset}|SPREAD", f"{asset} spread {spread*100:.0f}c > {DC_MAX_SPREAD_CENTS}c")
             return
 
-        entry_ask = snap["up_ask"] or snap["up"] if decision.side == "UP" else snap["down_ask"] or snap["down"]
+        entry_ask = (snap["up_ask"] or snap["up"]) if decision.side == "UP" else (snap["down_ask"] or snap["down"])
         size = self.position_size(entry_ask, decision.size_mult)
         self.log(f"{asset} ENTRY {decision.side} x{size} @ ~{entry_ask:.2f} | {STRATEGY} | {decision.reason}")
 
@@ -1145,18 +1190,42 @@ class KalshiTradingBot:
         self.positions[asset] = Position(
             asset=asset, side=decision.side, entry_price=tracked, ticker=snap["ticker"],
             size=size, entry_time=datetime.now(timezone.utc), entry_order_id=order_id,
-            strategy=STRATEGY, stop_loss=max(EXIT_THRESHOLD, tracked - MAX_LOSS_PER_TRADE),
+            strategy=STRATEGY, strike=strike or 0.0,
+            stop_loss=max(EXIT_THRESHOLD, tracked - MAX_LOSS_PER_TRADE),
             highest_price=tracked)
         st.phase = "IN_POSITION"
         st.last_order_time = time.time()
-        self.log(f"{asset} IN POSITION | {decision.side} @ {tracked:.2f} | {snap['ticker']}")
+        self.log(f"{asset} IN POSITION | {decision.side} @ {tracked:.2f} | {snap['ticker']} | strike ~{strike or 0:.0f}")
+
+    def _resolve_settlement(self, pos: Position, price: float) -> Optional[float]:
+        """Resolve a held position's settlement value (1.0 win / 0.0 loss).
+        Uses the OLD ticker's market result from the API; falls back to
+        current spot price vs the strike captured at entry. None = unknown."""
+        m = self.api.get_market(pos.ticker)
+        if m:
+            result = str(m.get("result", "")).lower()
+            if result in ("yes", "no"):
+                yes_won = (result == "yes")
+                return 1.0 if yes_won == (pos.side == "UP") else 0.0
+            status = str(m.get("status", "")).lower()
+            if status in ("settled", "finalized", "closed", "determined"):
+                ref = (self._parse_price(m.get("last_price_dollars", m.get("last_price")))
+                       or self._parse_price(m.get("yes_bid_dollars", m.get("yes_bid"))))
+                if ref >= 0.99 or (0 < ref <= 0.01):
+                    yes_won = ref >= 0.99
+                    return 1.0 if yes_won == (pos.side == "UP") else 0.0
+        # Fallback: settle by spot price vs entry-captured strike
+        if pos.strike > 0 and price > 0:
+            yes_won = price >= pos.strike
+            return 1.0 if yes_won == (pos.side == "UP") else 0.0
+        return None
 
     # ------------------------------ position management ------------------------------
     def manage_position(self, asset: str, snap: dict, price: float, strike: Optional[float]):
         pos = self.positions[asset]
         st = self.states[asset]
         mins_left = snap["minutes_left"]
-        current = snap["up_bid"] or snap["up"] if pos.side == "UP" else snap["down_bid"] or snap["down"]
+        current = (snap["up_bid"] or snap["up"]) if pos.side == "UP" else (snap["down_bid"] or snap["down"])
         pnl = (current - pos.entry_price) * pos.size
         pos.max_pnl = max(pos.max_pnl, pnl)
         pos.highest_price = max(pos.highest_price, current)
@@ -1164,7 +1233,8 @@ class KalshiTradingBot:
         use_dc = pos.strategy in ("delta_capture", "delta_capture_scalp")
 
         def do_close(reason, aggressive=False):
-            closed, exit_price = self.close_position(asset, reason, aggressive)
+            closed, exit_price = self.close_position(asset, reason, aggressive,
+                                                     paper_price=current)
             if closed:
                 self.record_trade(asset, (exit_price - pos.entry_price) * pos.size, reason, exit_price)
                 del self.positions[asset]
@@ -1177,17 +1247,24 @@ class KalshiTradingBot:
         if mins_left <= TIME_EXIT_MINUTES and not use_dc:
             self.log(f"{asset} TIME EXIT | {mins_left:.1f}m left")
             return do_close("TIME_EXIT", aggressive=True)
-        if mins_left <= 1.0:
+        if mins_left <= 1.0 and not use_dc:
             self.log(f"{asset} FINAL EXIT | {mins_left:.1f}m left")
             return do_close("FORCED_CLOSE", aggressive=True)
 
+        # DC: window expired but ticker hasn't rolled yet — resolve at settlement
+        if use_dc and mins_left <= 0.25:
+            final = self._resolve_settlement(pos, price)
+            if final is not None:
+                self.record_trade(asset, (final - pos.entry_price) * pos.size, "SETTLEMENT", final)
+                del self.positions[asset]
+                st.phase = "WAIT_WINDOW"
+            return True
+
         # Market moved to a new ticker (window rolled) → resolve P&L at settlement
         if snap["ticker"] != pos.ticker:
-            final = 1.0 if (snap["up"] >= 0.99 and pos.side == "UP") or (snap["down"] >= 0.99 and pos.side == "DOWN") else 0.0
-            if snap["up"] >= 0.99:
-                final = 1.0 if pos.side == "UP" else 0.0
-            elif snap["down"] >= 0.99:
-                final = 1.0 if pos.side == "DOWN" else 0.0
+            final = self._resolve_settlement(pos, price)
+            if final is None:
+                return True  # Resolution unknown yet — keep checking next loop
             self.record_trade(asset, (final - pos.entry_price) * pos.size, "SETTLEMENT", final)
             del self.positions[asset]
             st.phase = "WAIT_WINDOW"
@@ -1195,9 +1272,12 @@ class KalshiTradingBot:
 
         if use_dc:
             # Delta Capture: hold to settlement; optional salvage exit on delta flip
-            if DC_SALVAGE_EXIT and strike and price > 0 and mins_left > DC_SALVAGE_MIN_MINUTES:
+            if (DC_SALVAGE_EXIT and strike and price > 0
+                    and mins_left > DC_SALVAGE_MIN_MINUTES
+                    and hold >= DC_SALVAGE_MIN_HOLD_S):
                 delta = (price - strike) / strike
-                flipped = (pos.side == "UP" and delta < 0) or (pos.side == "DOWN" and delta > 0)
+                flipped = ((pos.side == "UP" and delta < -DC_SALVAGE_MIN_FLIP_PCT)
+                           or (pos.side == "DOWN" and delta > DC_SALVAGE_MIN_FLIP_PCT))
                 if flipped:
                     self.log(f"{asset} SALVAGE EXIT | delta flipped to {delta:.4%}")
                     return do_close("DELTA_FLIP_SALVAGE")
