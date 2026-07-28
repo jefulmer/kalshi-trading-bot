@@ -1,24 +1,27 @@
 # kalshi-trading-bot
 
-Automated trading bot for Kalshi 15-minute crypto up/down markets (default: BTC, series `KXBTC15M`).
+Automated trading bot for Kalshi 15-minute crypto up/down markets (default: BTC, series `KXBTC15M`). Single-file Python script — no config files, all settings are variables at the top of `kalshi_trading_bot.py`.
 
-**Version:** 0.2.0 (2026-07-27)
+**Current version: v0.3.0**
 
-## Overview
+## Strategy: Delta Capture + StochRSI Confirm + MTF filter
 
-The default strategy is **Delta Capture + StochRSI Confirm**: enter a 15-minute window with 3–8 minutes remaining, only when spot price is already on your side of the strike, the contract is underpriced relative to live conditions, and 1-minute StochRSI confirms short-term momentum. Positions are treated as defined-risk binaries and held to settlement, with an optional salvage exit if the price delta flips decisively against the position.
+The bot enters inside a live 15-minute window (3–8 minutes remaining) only when:
 
-Six legacy strategies are retained and selectable via the `STRATEGY` variable at the top of the script.
+1. Spot price is already on your side of the window strike (delta 0.02%–0.10%),
+2. 1-minute StochRSI confirms short-term momentum,
+3. The contract ask is cheap enough to be worth the risk (**≤ $0.62** as of v0.3.0 — expensive favorites have negative expectancy),
+4. The Multi-Timeframe Momentum (MTF) composite (1d/4h/1h/15m/5m, weighted toward the short timeframes) doesn't oppose the trade,
+5. Spread ≤ 4¢ and 1m ATR is below the burst-volatility cap.
 
-## Features
+Positions are defined-risk binaries: default behavior is hold to settlement. Optional salvage exit fires only on a meaningful delta flip (>0.05%, held >120s).
 
-- Paper/test mode automatically when no API keys are present (accurate paper P&L booked at live market prices)
-- Live trading with RSA-signed Kalshi API requests, fill verification, and order retry logic
-- 1-minute price feed (Kraken primary, Binance fallback) with rolling buffer for StochRSI/ATR
-- Risk gates: daily loss limit, drawdown halt, 3-consecutive-loss 60-minute pause, per-window trade cap, post-trade cooldown
-- Rate-limit-safe: response caching, adaptive polling, automatic retry with backoff on 429/5xx
-- CSV logging of every trade and running performance stats
-- Optional live terminal dashboard (`--pretty`)
+Extras:
+
+- **Momentum scalp** variant in minutes 1–3 of the window at half size.
+- **Trend-aligned relaxation**: with a strong MTF tailwind (score ≥ 0.45) the delta cap widens to 0.25% and entries up to $0.68 are allowed at reduced size.
+- **Risk gates**: daily loss limit, drawdown halt, 3 consecutive losses → 60-minute pause, per-window trade cap, post-trade cooldown.
+- Legacy strategies (`rsi_extreme`, `multi_tf_confluence`, `mean_reversion`, `momentum_breakout`, `divergence_play`) remain selectable via the `STRATEGY` variable.
 
 ## Requirements
 
@@ -27,58 +30,59 @@ Six legacy strategies are retained and selectable via the `STRATEGY` variable at
 
 ## Setup
 
-1. Clone the repo and install dependencies:
-   ```bash
-   pip install requests cryptography
-   ```
-2. **Paper mode:** do nothing — with no keys present the bot paper-trades automatically.
-3. **Live mode:** create an `api_keys/` folder next to the script containing:
+1. Clone/download this repo.
+2. **Paper mode:** run as-is — no keys needed.
+3. **Live mode:** create an `api_keys/` subfolder with:
    - `apikey.json` — your Kalshi API key ID (JSON with a `code` field, or raw text)
-   - `privatekey.json` — your RSA private key PEM (JSON with a `code` field, or raw text)
+   - `privatekey.json` — your RSA private key (PEM, JSON with a `code` field, or raw text)
 
-   Keep `api_keys/` out of version control (it is in `.gitignore` — never commit keys).
+   For the Kalshi demo environment, uncomment the demo `KALSHI_API_BASE` line and/or use `apikey_demo.json` / `privatekey_demo.json`.
 
-## Usage
+## Run
 
 ```bash
-python3 kalshi_trading_bot.py            # normal run
-python3 kalshi_trading_bot.py --paper    # force paper mode even if keys exist
+python3 kalshi_trading_bot.py            # auto: live if keys found, else paper
+python3 kalshi_trading_bot.py --paper    # force paper mode
 python3 kalshi_trading_bot.py --pretty   # live terminal dashboard
 ```
 
-Stop with `Ctrl+C` — a session summary (trades, win rate, P&L) is printed on exit.
+Typical VPS deployment (Debian):
 
-## Configuration
+```bash
+nohup python3 kalshi_trading_bot.py > bot.out 2>&1 &
+tail -f logs/kalshi_bot_*.log
+```
 
-All settings are variables at the top of `kalshi_trading_bot.py` (no config file). Key groups:
+## Key settings (top of script)
 
-| Group | Highlights |
-|---|---|
-| Strategy | `STRATEGY`, `ASSETS` |
-| Delta Capture | entry window 3–8 min, delta band 0.02%–0.10%, max entry $0.70, ATR/spread caps, scalp variant, salvage-exit tuning |
-| Sizing | `ORDER_SIZE`, `MAX_ORDER_SIZE`, 2%-of-bankroll risk cap |
-| Risk gates | `MAX_DAILY_LOSS`, `MAX_DRAWDOWN_PERCENT`, `MAX_CONSECUTIVE_LOSSES`, `PAUSE_AFTER_LOSS_STREAK_MIN` |
-| Exits | `PROFIT_TARGET`, `TIME_EXIT_MINUTES`, stop/trailing settings (legacy strategies) |
-| Polling | conservative defaults — do not lower (Kalshi + exchange rate limits) |
+| Setting | Default | Notes |
+|---|---|---|
+| `DC_MAX_ENTRY_PRICE` | 0.62 | Do not raise without win-rate evidence — see handoff |
+| `DC_ENTRY_WINDOW_MIN` | (3.0, 8.0) | Minutes-left entry window |
+| `MTF_ENABLED` | True | False = exact v0.1.2 behavior |
+| `MTF_COUNTER_TREND_BLOCK` | True | Veto entries against the MTF bias |
+| `MTF_STRONG_SCORE` | 0.45 | Threshold for trend-relaxed entries |
+| `MAX_ORDER_SIZE` | 1 | Hard safety cap on contracts per trade |
+| `MAX_DAILY_LOSS` | 10.0 | $ daily halt |
+| `FORCE_PAPER_MODE` | False | True = always paper-trade |
 
 ## Output
 
-All output lands in `logs/`:
+All runtime files land in `logs/`:
 
-- `kalshi_bot_<timestamp>.log` — full DEBUG log
-- `trades_<timestamp>.csv` — one row per closed trade (side, entry/exit, reason, P&L)
-- `perf_<timestamp>.csv` — running win/loss and P&L snapshot per trade
+- `kalshi_bot_<ts>.log` — full event log (entries, exits, MTF blocks, halts)
+- `trades_<ts>.csv` — one row per closed trade with entry/exit/reason/P&L
+- `perf_<ts>.csv` — running performance snapshot per trade
 
-## Exit reasons
+## Changelog highlights
 
-| Reason | Meaning |
-|---|---|
-| `SETTLEMENT` | Held to window close; resolved from the market result (or price vs. strike fallback) |
-| `PROFIT_TARGET` | Contract bid reached `PROFIT_TARGET` |
-| `DELTA_FLIP_SALVAGE` | Delta flipped decisively against the position with time left — cut early |
-| `TIME_EXIT` / `FORCED_CLOSE` | Legacy strategies only: forced exit near window close |
-| `STOP_LOSS` / `TRAILING_STOP` / `EARLY_TIME_STOP` / `MAX_HOLD_TIME` | Legacy strategy exits |
+- **v0.3.0** — Entry-price cap 0.70→0.62 (expensive entries had negative expectancy); MTF weights rebalanced toward 15m/5m (sticky 1d pinned bias all session); salvage-exit noise trigger fixed; MTF-block logging now accurate.
+- **v0.2.0** — Multi-Timeframe Momentum engine (counter-trend gate + trend-aligned relaxation).
+- **v0.1.2** — DC positions ride to settlement; salvage hair-trigger fix; balance-parsing fix.
+- **v0.1.1** — Paper-mode exit accounting fix; window-roll settlement fix.
+
+See `HANDOFF_kalshi_trading_bot.md` for the full tuning rationale and pre-live checklist.
 
 ## Disclaimer
 
-For educational purposes. Trading prediction markets involves substantial risk of loss. Test thoroughly in paper mode before enabling live orders.
+Trading involves risk of loss. This bot is provided as-is; paper-test thoroughly before connecting real funds.
