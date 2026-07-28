@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kalshi-trading-bot (v0.3.0)
+kalshi-trading-bot (v0.4.0)
 ===========================
 Automated trading bot for Kalshi 15-minute crypto up/down markets
 (default: BTC, series KXBTC15M).
@@ -27,6 +27,45 @@ MODES:
   - Set FORCE_PAPER_MODE = True to override and always paper-trade.
 
 CHANGELOG:
+  v0.4.0 (2026-07-28):
+    - FIX (CRITICAL, live): close_position could loop sell retries for 20+
+      minutes ("CRITICAL: close_position failed after 6 attempts" repeating
+      all session 2026-07-27/28). Root causes addressed:
+        (a) sell-order rejection body was never logged — now logged every attempt;
+        (b) sells are no longer attempted once the window has expired
+            (mins_left <= 0.25) or the ticker has rolled — the position is
+            resolved at settlement instead of hammering a dead orderbook;
+        (c) EMERGENCY_EXIT retries are capped (EMERGENCY_MAX_RETRIES), then the
+            bot falls back to settlement resolution instead of retrying forever;
+        (d) reduce_only flag removed from exit orders (rejected on some Kalshi
+            markets); exit side mapping made explicit.
+    - FIX (CRITICAL, P&L): DOWN fill-price flip heuristic. Log proof:
+      "ORDER ... BUY DOWN 1 @ 43c" followed by "IN POSITION | DOWN @ 0.57".
+      verify_fill returned the no-side fill price (0.43) and the
+      `side=="DOWN" and price<0.5 -> 1-price` heuristic flipped it to 0.57,
+      corrupting entry price, P&L, stops and CSV records. Fill price is now
+      resolved side-aware: no_price/fill count fields are preferred for DOWN
+      orders and the blind 1-x flip is removed (kept only when the price is
+      provably yes-denominated for a DOWN order).
+    - FIX: paper mode no longer calls authenticated endpoints
+      (has_existing_position/_get_balance) — avoids pointless 401s and
+      rate-limit burn when running without keys.
+    - FIX: "Sell retry 6/5" label (range(6) vs /5).
+    - NEW: MTF conviction gate MTF_MIN_TRADE_SCORE (default 0.20). In a
+      7-day 1-minute backtest (10,080 candles, Jul 21-28), trades taken with
+      |MTF score| < 0.30 went 50% WR / negative P&L; |score| >= 0.30 went 75%.
+      Entries now require |score| >= 0.20 (NEUTRAL-zone chop is skipped).
+    - TUNE (backtest): DC_ATR_MAX_PCT 0.0005 -> 0.00045 and
+      MTF_STRONG_SCORE 0.45 -> 0.40. Same-week backtest of the full config:
+      baseline 24 trades / 62.5% WR / +$0.75 -> new config 12 trades /
+      83.3% WR / +$1.67 (fewer, better trades).
+    - TUNE: DC_SCALP_MAX_PRICE 0.60 -> 0.58 (best backtest bucket).
+    - NEW: market strike taken from the Kalshi market object when present
+      (floor_strike/strike fields), falling back to the Kraken-candle
+      estimate — Kraken vs Kalshi benchmark diverges $40-70 at times, which
+      skews delta readings.
+    - NEW: fee-adjusted P&L estimate in trade CSV/log (Kalshi taker fee
+      ~0.07 * C * P * (1-P) per contract), column FeeEst added.
   v0.3.0 (2026-07-27):
     - TUNE: entry-price discipline after 2026-07-26/27 paper session (12 trades,
       50% WR, -$1.16). Entries >= $0.64 netted -$1.53; entries <= $0.62 netted
@@ -139,12 +178,13 @@ DC_MAX_ENTRY_PRICE = 0.62         # Never pay more than 62c — entries above th
 DC_STOCH_K_LONG_MIN = 50.0        # UP entry: K must be above this...
 DC_REQUIRE_K_GT_D = True          # ...and K > D (momentum confirmation)
 DC_DEAD_ZONE = (45.0, 55.0)       # No-trade StochRSI K dead zone (no momentum read)
-DC_ATR_MAX_PCT = 0.0005           # 1m ATR(14) above this = burst volatility, skip
+DC_ATR_MAX_PCT = 0.00045          # 1m ATR(14) above this = burst volatility, skip
+                                  # (7-day backtest: 0.00045 beat 0.0005 on WR and P&L)
 DC_MAX_SPREAD_CENTS = 4           # Skip if contract spread wider than this
 DC_SCALP_ENABLED = True           # Early-window momentum scalp variant
 DC_SCALP_WINDOW_MIN = (12.0, 14.0)  # Minutes-left range = minutes 1-3 of window
 DC_SCALP_MIN_MOVE_PCT = 0.0005    # Scalp: price must already be >=0.05% from strike
-DC_SCALP_MAX_PRICE = 0.60         # Scalp: max entry price
+DC_SCALP_MAX_PRICE = 0.58         # Scalp: max entry price (best backtest bucket)
 DC_SCALP_K_UP = 60.0              # Scalp UP: K above this
 DC_SCALP_K_DOWN = 40.0            # Scalp DOWN: K below this
 DC_SCALP_SIZE_MULT = 0.5          # Scalp trades at half size
@@ -171,7 +211,10 @@ MTF_RET_BARS = 3                  # Return measured over last N closed bars
 MTF_CACHE_TTL_S = 120             # Higher-TF data refreshes at most this often
 MTF_COUNTER_TREND_BLOCK = True    # Block entries against the MTF bias
 MTF_MIN_SCORE = 0.15              # |score| below this = NEUTRAL (no bias enforced)
-MTF_STRONG_SCORE = 0.45           # >= this = strong trend; relaxes delta cap + dead zone
+MTF_STRONG_SCORE = 0.40           # >= this = strong trend; relaxes delta cap + dead zone
+MTF_MIN_TRADE_SCORE = 0.20        # Conviction gate: skip ALL entries while |score| is
+                                  # below this. 7-day backtest: |score|<0.30 trades went
+                                  # 50% WR / negative P&L; >=0.30 went 75%. 0 = disable.
 MTF_TREND_MAX_DELTA_PCT = 0.0025  # Trend-aligned entries allowed up to 0.25% delta
 MTF_TREND_MAX_PRICE = 0.68        # Trend continuation entries may pay up to 68c
                                   # (still >= ~1:2 payoff vs. full stake)
@@ -241,6 +284,8 @@ FILL_BUFFER = 0.02                # Limit buffer to improve fill odds
 DYNAMIC_FILL_BUFFER = True        # Scale buffer with live spread
 ENTRY_TIME_IN_FORCE = "good_till_canceled"   # or "immediate_or_cancel"
 ORDER_TIMEOUT_SECONDS = 15
+EMERGENCY_MAX_RETRIES = 3         # EMERGENCY_EXIT loops before falling back to settlement
+KALSHI_TAKER_FEE_COEFF = 0.07     # fee = coeff * C * P * (1-P) per contract (estimate)
 
 # --- Polling / rate-limit safety (do not lower; Kalshi + exchange limits) ---
 POLL_INTERVAL_MONITORING_S = 1.0  # Loop cadence while in/near a position
@@ -288,7 +333,7 @@ def setup_logging(log_dir: str = "logs", pretty_display: bool = False):
     fh.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
     logger.addHandler(fh)
     for f, headers in [
-        (trade_file, ['Timestamp', 'Asset', 'Side', 'EntryPrice', 'ExitPrice', 'Reason', 'PnL', 'Ticker', 'Session', 'Strategy']),
+        (trade_file, ['Timestamp', 'Asset', 'Side', 'EntryPrice', 'ExitPrice', 'Reason', 'PnL', 'FeeEst', 'PnLAfterFees', 'Ticker', 'Session', 'Strategy']),
         (perf_file, ['Timestamp', 'Asset', 'TotalTrades', 'Wins', 'Losses', 'WinRate', 'TotalPnL', 'ConsecutiveLosses'])]:
         with open(f, 'w', newline='') as out:
             csv.writer(out).writerow(headers)
@@ -730,6 +775,10 @@ class StrategyEngine:
             return None                                   # Burst volatility / whipsaw
         if spread_cents > DC_MAX_SPREAD_CENTS:
             return None                                   # Spread too wide
+        # Conviction gate: chop (|score| < MTF_MIN_TRADE_SCORE) produced 50% WR /
+        # negative P&L in the 7-day backtest — sit those windows out entirely.
+        if MTF_ENABLED and MTF_MIN_TRADE_SCORE > 0 and abs(mtf_score) < MTF_MIN_TRADE_SCORE:
+            return None
 
         delta = (price - strike) / strike if strike > 0 else 0.0
         self.last_mtf_block = None
@@ -883,6 +932,7 @@ class AssetState:
     last_reconcile_time: float = 0.0
     confirmation_count: int = 0
     last_proposed_side: str = ""
+    emergency_retries: int = 0
     price_history: deque = field(default_factory=lambda: deque(maxlen=20))
 
 
@@ -970,10 +1020,19 @@ class KalshiTradingBot:
         if up <= 0: up = self._parse_price(m.get("last_price_dollars", m.get("last_price")))
         if up <= 0 and down > 0: up = 1.0 - down
         if down <= 0 and up > 0: down = 1.0 - up
+        # Prefer the market's own strike (Kalshi benchmark) over the
+        # Kraken-candle estimate — the two diverge $40-70 at times.
+        mkt_strike = 0.0
+        for sk in ("floor_strike", "strike", "cap_strike"):
+            v = self._safe_float(m.get(sk, 0))
+            if v > 0:
+                mkt_strike = v
+                break
         snap = {"ticker": ticker, "up": up, "down": down,
                 "up_bid": yes_bid, "up_ask": yes_ask, "down_bid": no_bid, "down_ask": no_ask,
                 "minutes_left": self.minutes_left(m.get("close_time", "")),
-                "status": m.get("status", "open")}
+                "status": m.get("status", "open"),
+                "market_strike": mkt_strike}
         self._snapshot_cache[asset] = (now, snap)
         return snap
 
@@ -1004,6 +1063,8 @@ class KalshiTradingBot:
         return yes_bid, yes_ask, no_bid, no_ask
 
     def _get_balance(self) -> float:
+        if not self.live_orders:
+            return BANKROLL  # paper mode: skip the authenticated call entirely
         now = time.time()
         bal, ts = self._balance_cache
         if now - ts < BALANCE_CACHE_TTL_S and ts > 0:
@@ -1020,6 +1081,8 @@ class KalshiTradingBot:
         return bal
 
     def has_existing_position(self, ticker: str, force: bool = False) -> bool:
+        if not self.live_orders:
+            return False  # paper mode: no account positions exist; skip 401s
         now = time.time()
         if not force and ticker in self._pos_cache and now - self._pos_cache[ticker][1] < 5:
             return self._pos_cache[ticker][0]
@@ -1152,21 +1215,24 @@ class KalshiTradingBot:
             result = self.api.place_order(ticker=pos.ticker, action="sell",
                                           side="yes" if pos.side == "UP" else "no",
                                           count=pos.size, price=cents,
-                                          time_in_force="immediate_or_cancel", reduce_only=True)
+                                          time_in_force="immediate_or_cancel")
             if result.get("status", 0) in (200, 201):
                 time.sleep(1.0)
                 self._pos_cache.pop(pos.ticker, None)
                 if not self.has_existing_position(pos.ticker, force=True):
                     _, avg = self._parse_fills_price(self.api.get_fills(ticker=pos.ticker))
                     actual = avg if avg > 0 else exit_price
-                    if pos.side == "DOWN" and 0 < actual < 0.5:
-                        actual = 1.0 - actual
                     return True, actual
+            else:
+                # Log the rejection body — v0.3.0 retried blind for 20+ minutes
+                body = result.get("response_body", {})
+                self.log(f"{asset} Sell rejected HTTP {result.get('status')}: "
+                         f"{body.get('message','') or body or result.get('error','')}", logging.WARNING)
             self._pos_cache.pop(pos.ticker, None)
             if not self.has_existing_position(pos.ticker, force=True):
                 return True, exit_price
             backoff = min(2 ** attempt, 8)
-            self.log(f"{asset} Sell retry {attempt+1}/5 (backoff {backoff}s)")
+            self.log(f"{asset} Sell retry {attempt+1}/6 (backoff {backoff}s)")
             time.sleep(backoff)
         self.log(f"{asset} CRITICAL: close_position failed after 6 attempts", logging.ERROR)
         return False, 0.0
@@ -1196,10 +1262,19 @@ class KalshiTradingBot:
                 st.loss_pause_until = time.time() + PAUSE_AFTER_LOSS_STREAK_MIN * 60
                 self.log(f"{asset} PAUSE {PAUSE_AFTER_LOSS_STREAK_MIN}m after {st.consecutive_losses} consecutive losses")
         self.log(f"{asset} {reason} {outcome} | P&L: ${pnl:.2f} | Total: ${st.total_pnl:.2f}")
+        # Kalshi taker-fee estimate: coeff * C * P * (1-P) per side; settlement
+        # exits have no exit-side fee.
+        fee_est = 0.0
+        if pos:
+            c = pos.size
+            fee_est = KALSHI_TAKER_FEE_COEFF * c * pos.entry_price * (1 - pos.entry_price)
+            if reason not in ("SETTLEMENT",) and 0 < exit_price < 1:
+                fee_est += KALSHI_TAKER_FEE_COEFF * c * exit_price * (1 - exit_price)
         with open(self.trade_file, 'a', newline='') as f:
             csv.writer(f).writerow([datetime.now(timezone.utc).isoformat(), asset,
                                     pos.side if pos else "", pos.entry_price if pos else "",
-                                    exit_price, reason, pnl, pos.ticker if pos else "",
+                                    exit_price, reason, pnl, round(fee_est, 4), round(pnl - fee_est, 4),
+                                    pos.ticker if pos else "",
                                     st.session_trade_count, pos.strategy if pos else STRATEGY])
         with open(self.perf_file, 'a', newline='') as f:
             wr = st.win_count / st.total_trades * 100 if st.total_trades else 0
@@ -1344,9 +1419,21 @@ class KalshiTradingBot:
                 self.log(f"{asset} Order did not fill ({st.entry_attempts}/2)")
                 return
         st.entry_attempts = 0
-        tracked = fill_price if fill_price > 0 else (order_price or entry_ask)
-        if decision.side == "DOWN" and 0 < tracked < 0.5:
-            tracked = 1.0 - tracked
+        # Fill price resolution (side-aware). The fills/orders API may return a
+        # YES-denominated price even for DOWN (no-side) orders — v0.3.0 blindly
+        # applied `1 - price` for DOWN when price < 0.5 and booked a real 43c
+        # fill as 0.57. Our own submitted limit (order_price) is always
+        # side-denominated, so trust it; accept the API fill price only when it
+        # agrees within a few cents.
+        tracked = order_price if order_price > 0 else entry_ask
+        if fill_price > 0:
+            if abs(fill_price - tracked) <= 0.05:
+                tracked = fill_price  # side-denominated agreement — use actual
+            elif decision.side == "DOWN" and abs((1.0 - fill_price) - tracked) <= 0.05:
+                tracked = 1.0 - fill_price  # provably YES-denominated — flip once
+            else:
+                self.log(f"{asset} fill price {fill_price:.2f} disagrees with order "
+                         f"{tracked:.2f} — booking order price", logging.WARNING)
         self.positions[asset] = Position(
             asset=asset, side=decision.side, entry_price=tracked, ticker=snap["ticker"],
             size=size, entry_time=datetime.now(timezone.utc), entry_order_id=order_id,
@@ -1481,7 +1568,7 @@ class KalshiTradingBot:
         width = 68
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         lines = ["+" + "-" * width + "+",
-                 f"|  kalshi-trading-bot v0.3.0  |  {now:<33}|",
+                 f"|  kalshi-trading-bot v0.4.0  |  {now:<33}|",
                  "+" + "-" * width + "+"]
         mode = "LIVE" if self.live_orders else "PAPER"
         wr = self.daily_wins / max(1, self.daily_trades) * 100
@@ -1516,7 +1603,7 @@ class KalshiTradingBot:
     # ------------------------------ run loop ------------------------------
     def run(self):
         self.log("=" * 60)
-        self.log(f"kalshi-trading-bot v0.3.0 | Strategy: {STRATEGY}")
+        self.log(f"kalshi-trading-bot v0.4.0 | Strategy: {STRATEGY}")
         self.log(f"Mode: {'LIVE ORDERS' if self.live_orders else 'PAPER/TEST'} | Assets: {ASSETS}")
         self.log(f"Delta Capture: window {DC_ENTRY_WINDOW_MIN}m | delta {DC_MIN_DELTA_PCT:.4%}-{DC_MAX_DELTA_PCT:.4%} "
                  f"| max entry ${DC_MAX_ENTRY_PRICE} | ATR cap {DC_ATR_MAX_PCT:.4%} | spread cap {DC_MAX_SPREAD_CENTS}c")
@@ -1525,7 +1612,8 @@ class KalshiTradingBot:
         if MTF_ENABLED:
             tfs = "/".join(MTF_TIMEFRAMES.keys())
             self.log(f"MTF momentum: {tfs} | block counter-trend: {MTF_COUNTER_TREND_BLOCK} | "
-                     f"strong >= {MTF_STRONG_SCORE} (delta cap {MTF_TREND_MAX_DELTA_PCT:.4%}, max ${MTF_TREND_MAX_PRICE}, "
+                     f"min trade score {MTF_MIN_TRADE_SCORE} | strong >= {MTF_STRONG_SCORE} "
+                     f"(delta cap {MTF_TREND_MAX_DELTA_PCT:.4%}, max ${MTF_TREND_MAX_PRICE}, "
                      f"size x{MTF_TREND_SIZE_MULT})")
         self.log("=" * 60)
         try:
@@ -1543,7 +1631,7 @@ class KalshiTradingBot:
                             self.log_once(f"{asset}|NO_MKT", f"{asset} waiting for market data")
                             continue
                         price = self.feeds[asset].poll()
-                        strike = self.feeds[asset].window_strike()
+                        strike = snap.get("market_strike") or self.feeds[asset].window_strike()
                         # New 15-min window → reset per-session state
                         session_key = f"{asset}_{snap['ticker']}"
                         if st.session_key != session_key:
@@ -1560,13 +1648,36 @@ class KalshiTradingBot:
                         if asset in self.positions:
                             any_active = True
                             if st.phase == "EMERGENCY_EXIT":
-                                closed, exit_price = self.close_position(asset, "emergency_retry", aggressive=True)
-                                if closed:
-                                    pos = self.positions[asset]
-                                    self.record_trade(asset, (exit_price - pos.entry_price) * pos.size,
-                                                      "EMERGENCY_CLOSE", exit_price)
+                                pos = self.positions[asset]
+                                # Near/past expiry: stop selling a dead orderbook —
+                                # resolve at settlement instead (defined-risk binary).
+                                final = None
+                                if snap["minutes_left"] <= 0.25 or snap["ticker"] != pos.ticker:
+                                    final = self._resolve_settlement(pos, price)
+                                if final is not None:
+                                    self.record_trade(asset, (final - pos.entry_price) * pos.size,
+                                                      "SETTLEMENT", final)
                                     del self.positions[asset]
                                     st.phase = "WAIT_WINDOW"
+                                    st.emergency_retries = 0
+                                elif st.emergency_retries >= EMERGENCY_MAX_RETRIES:
+                                    # Retries exhausted: leave the position to settle;
+                                    # the mins_left<=0.25 / ticker-roll paths in
+                                    # manage_position will resolve it.
+                                    self.log(f"{asset} emergency retries exhausted — holding to settlement",
+                                             logging.WARNING)
+                                    st.phase = "IN_POSITION"
+                                    st.emergency_retries = 0
+                                else:
+                                    closed, exit_price = self.close_position(asset, "emergency_retry", aggressive=True)
+                                    if closed:
+                                        self.record_trade(asset, (exit_price - pos.entry_price) * pos.size,
+                                                          "EMERGENCY_CLOSE", exit_price)
+                                        del self.positions[asset]
+                                        st.phase = "WAIT_WINDOW"
+                                        st.emergency_retries = 0
+                                    else:
+                                        st.emergency_retries += 1
                             else:
                                 self.manage_position(asset, snap, price, strike)
                         elif not halted and st.phase != "HAS_POSITION":
@@ -1624,7 +1735,7 @@ def load_api_keys_from_dir() -> Tuple[str, str]:
 
 def main():
     global PRETTY_DISPLAY
-    parser = argparse.ArgumentParser(description="kalshi-trading-bot v0.3.0")
+    parser = argparse.ArgumentParser(description="kalshi-trading-bot v0.4.0")
     parser.add_argument("--paper", action="store_true", help="Force paper/test mode")
     parser.add_argument("--pretty", action="store_true", help="Live terminal dashboard")
     args = parser.parse_args()
