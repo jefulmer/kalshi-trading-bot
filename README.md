@@ -81,8 +81,6 @@ All runtime files land in `logs/`:
 - **v0.1.2** — DC positions ride to settlement; salvage hair-trigger fix; balance-parsing fix.
 - **v0.1.1** — Paper-mode exit accounting fix; window-roll settlement fix.
 
-See `HANDOFF_kalshi_trading_bot.md` for the full tuning rationale and pre-live checklist.
-
 ## Disclaimer
 
 Trading involves risk of loss. This bot is provided as-is; paper-test thoroughly before connecting real funds.
