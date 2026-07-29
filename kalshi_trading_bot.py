@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kalshi-trading-bot (v0.4.0)
+kalshi-trading-bot (v0.5.0)
 ===========================
 Automated trading bot for Kalshi 15-minute crypto up/down markets
 (default: BTC, series KXBTC15M).
@@ -27,6 +27,37 @@ MODES:
   - Set FORCE_PAPER_MODE = True to override and always paper-trade.
 
 CHANGELOG:
+  v0.5.0 (2026-07-29):
+    - FIX (logging): stale MTF BLOCK lines. StrategyEngine.last_mtf_block was
+      reset AFTER the MTF conviction-gate return in delta_capture(), so a veto
+      from a previous window survived and evaluate_entry logged
+      "MTF BLOCK | X signal vetoed" for windows the conviction gate actually
+      killed — including contradictory "MTF BLOCK ... NEUTRAL score +0.01"
+      lines (2026-07-28 paper run). last_mtf_block is now reset before ALL
+      gate returns, and conviction-gate vetoes log on their own path:
+      "MTF GATE | score ... below conviction threshold".
+    - TUNE (backtest, 24h x 6 assets, backtest_kalshi.py): the v0.4.0 paper
+      session traded ZERO times in 18h; the replay confirms the config is
+      over-constrained and that the binding constraint DIVERGES BY ASSET:
+        * MTF_MIN_TRADE_SCORE 0.20 -> 0.10. At 0.20 the conviction gate alone
+          vetoed ~all qualifiers (18h live: 0 trades). 7-day BTC backtest still
+          supports filtering chop, so a light 0.10 gate is kept.
+        * DC_ATR_MAX_PCT 0.00045 -> 0.0006 global + NEW ASSET_OVERRIDES
+          per-asset ATR caps (ETH/SOL/XRP/DOGE 0.0010, BNB 0.0005). A single
+          global ATR cap calibrated on BTC blocked ~90% of entry checks on
+          ETH/SOL/XRP/DOGE (their median 1m ATR% is ~0.0007-0.0008 vs BTC
+          ~0.0004-0.0006). Per-asset caps ~= p75 of each asset's 24h ATR%
+          distribution. This is the main per-asset divergence found.
+        * Raw signal quality is comparable across assets (63-80% WR, XRP
+          weakest), so all other params stay global. 24h = 96 windows/asset:
+          results are directional, not statistically significant.
+    - NEW: full CLI. Every launch-relevant variable is overridable via
+      argparse flags (run with --help); flags take precedence over the script
+      defaults and are logged as "CLI override" at startup. --assets rebuilds
+      all asset-driven state. --asset-overrides accepts a JSON object, e.g.
+      --asset-overrides '{"ETH":{"MTF_MIN_TRADE_SCORE":0.15}}'.
+    - NEW: ASSET_OVERRIDES dict + asset_param() resolver. StrategyEngine
+      resolves every entry tunable as per-asset override with global fallback.
   v0.4.0 (2026-07-28):
     - FIX (CRITICAL, live): close_position could loop sell retries for 20+
       minutes ("CRITICAL: close_position failed after 6 attempts" repeating
@@ -178,8 +209,9 @@ DC_MAX_ENTRY_PRICE = 0.62         # Never pay more than 62c — entries above th
 DC_STOCH_K_LONG_MIN = 50.0        # UP entry: K must be above this...
 DC_REQUIRE_K_GT_D = True          # ...and K > D (momentum confirmation)
 DC_DEAD_ZONE = (45.0, 55.0)       # No-trade StochRSI K dead zone (no momentum read)
-DC_ATR_MAX_PCT = 0.00045          # 1m ATR(14) above this = burst volatility, skip
-                                  # (7-day backtest: 0.00045 beat 0.0005 on WR and P&L)
+DC_ATR_MAX_PCT = 0.0006           # 1m ATR(14) above this = burst volatility, skip.
+                                  # v0.5.0: 0.00045 -> 0.0006 (~p75 of BTC 24h ATR%);
+                                  # high-vol assets get per-asset caps via ASSET_OVERRIDES
 DC_MAX_SPREAD_CENTS = 4           # Skip if contract spread wider than this
 DC_SCALP_ENABLED = True           # Early-window momentum scalp variant
 DC_SCALP_WINDOW_MIN = (12.0, 14.0)  # Minutes-left range = minutes 1-3 of window
@@ -212,9 +244,13 @@ MTF_CACHE_TTL_S = 120             # Higher-TF data refreshes at most this often
 MTF_COUNTER_TREND_BLOCK = True    # Block entries against the MTF bias
 MTF_MIN_SCORE = 0.15              # |score| below this = NEUTRAL (no bias enforced)
 MTF_STRONG_SCORE = 0.40           # >= this = strong trend; relaxes delta cap + dead zone
-MTF_MIN_TRADE_SCORE = 0.20        # Conviction gate: skip ALL entries while |score| is
+MTF_MIN_TRADE_SCORE = 0.10        # Conviction gate: skip ALL entries while |score| is
                                   # below this. 7-day backtest: |score|<0.30 trades went
                                   # 50% WR / negative P&L; >=0.30 went 75%. 0 = disable.
+                                  # v0.5.0: 0.20 -> 0.10. 0.20 vetoed ~every qualifier in
+                                  # the 18h v0.4.0 paper run (zero trades) and in the 24h
+                                  # 6-asset replay; 0.10 keeps the chop filter without
+                                  # killing all trade flow.
 MTF_TREND_MAX_DELTA_PCT = 0.0025  # Trend-aligned entries allowed up to 0.25% delta
 MTF_TREND_MAX_PRICE = 0.68        # Trend continuation entries may pay up to 68c
                                   # (still >= ~1:2 payoff vs. full stake)
@@ -310,6 +346,31 @@ ASSET_SYMBOL_MAP = {   # Exchange spot symbols (Kraken pair, Binance symbol)
     "DOGE": ("DOGEUSD", "DOGEUSDT"), "HYPE": ("HYPEUSD", "HYPEUSDT"),
     "BNB": ("BNBUSD", "BNBUSDT"),
 }
+
+# --- Per-asset parameter overrides (v0.5.0) ---
+# Any entry-tunable global can be overridden per asset here; the engine
+# resolves each value as override-with-global-fallback via asset_param().
+# Basis: 24h x 6-asset backtest (backtest_kalshi.py / BACKTEST_REPORT.md).
+# The 1m ATR% level diverges ~2x across assets, so a single global ATR cap
+# either strangles high-vol assets or protects low-vol ones too little.
+# Caps below ~= p75 of each asset's 24h ATR% distribution (block the burstiest
+# quartile only). HYPE has no Binance spot feed — untested, no override.
+ASSET_OVERRIDES = {
+    "ETH":  {"DC_ATR_MAX_PCT": 0.0010},
+    "SOL":  {"DC_ATR_MAX_PCT": 0.0010},
+    "XRP":  {"DC_ATR_MAX_PCT": 0.0010},
+    "DOGE": {"DC_ATR_MAX_PCT": 0.0010},
+    "BNB":  {"DC_ATR_MAX_PCT": 0.0005},
+}
+
+
+def asset_param(asset: str, name: str):
+    """Resolve a tunable for an asset: ASSET_OVERRIDES first, else the module
+    global (which CLI flags may already have overridden)."""
+    ov = ASSET_OVERRIDES.get(asset)
+    if ov and name in ov:
+        return ov[name]
+    return globals()[name]
 
 
 # ============================================================================
@@ -675,7 +736,8 @@ class PriceFeed:
         if total_w <= 0:
             return 0.0, "NEUTRAL", "no-data"
         score = total_v / total_w
-        bias = "UP" if score >= MTF_MIN_SCORE else ("DOWN" if score <= -MTF_MIN_SCORE else "NEUTRAL")
+        min_score = asset_param(self.asset, "MTF_MIN_SCORE")
+        bias = "UP" if score >= min_score else ("DOWN" if score <= -min_score else "NEUTRAL")
         return score, bias, " ".join(parts)
 
     # --- Indicator math (1m closes) ---
@@ -760,7 +822,11 @@ class EntryDecision:
 class StrategyEngine:
     def __init__(self, feed: PriceFeed):
         self.feed = feed
+        self.asset = feed.asset
         self.last_mtf_block: Optional[str] = None  # set when MTF gate vetoes a qualifier
+        # (score, threshold) when the MTF conviction gate vetoed — logged on a
+        # separate path from last_mtf_block so the two gates are distinguishable
+        self.last_conviction_veto: Optional[Tuple[float, float]] = None
 
     # --- DEFAULT: Delta Capture + StochRSI Confirm (+ MTF filter, v0.2.0) ---
     def delta_capture(self, price: float, strike: float, mins_left: float,
@@ -770,78 +836,108 @@ class StrategyEngine:
         atr = self.feed.atr_pct()
         mtf_score, mtf_bias, mtf_detail = mtf
 
+        # Per-asset resolution: ASSET_OVERRIDES win over (CLI-overridable) globals
+        atr_max = asset_param(self.asset, "DC_ATR_MAX_PCT")
+        spread_max = asset_param(self.asset, "DC_MAX_SPREAD_CENTS")
+        min_trade_score = asset_param(self.asset, "MTF_MIN_TRADE_SCORE")
+        ct_block = asset_param(self.asset, "MTF_COUNTER_TREND_BLOCK")
+        strong_score = asset_param(self.asset, "MTF_STRONG_SCORE")
+        scalp_enabled = asset_param(self.asset, "DC_SCALP_ENABLED")
+        scalp_window = asset_param(self.asset, "DC_SCALP_WINDOW_MIN")
+        scalp_min_move = asset_param(self.asset, "DC_SCALP_MIN_MOVE_PCT")
+        scalp_max_price = asset_param(self.asset, "DC_SCALP_MAX_PRICE")
+        scalp_k_up = asset_param(self.asset, "DC_SCALP_K_UP")
+        scalp_k_down = asset_param(self.asset, "DC_SCALP_K_DOWN")
+        scalp_size_mult = asset_param(self.asset, "DC_SCALP_SIZE_MULT")
+        entry_window = asset_param(self.asset, "DC_ENTRY_WINDOW_MIN")
+        min_delta = asset_param(self.asset, "DC_MIN_DELTA_PCT")
+        max_delta = asset_param(self.asset, "DC_MAX_DELTA_PCT")
+        max_entry_price = asset_param(self.asset, "DC_MAX_ENTRY_PRICE")
+        trend_max_delta = asset_param(self.asset, "MTF_TREND_MAX_DELTA_PCT")
+        trend_max_price = asset_param(self.asset, "MTF_TREND_MAX_PRICE")
+        trend_size_mult = asset_param(self.asset, "MTF_TREND_SIZE_MULT")
+        stoch_k_long_min = asset_param(self.asset, "DC_STOCH_K_LONG_MIN")
+        require_k_gt_d = asset_param(self.asset, "DC_REQUIRE_K_GT_D")
+
+        # Reset veto flags BEFORE every gate return — v0.4.0 reset
+        # last_mtf_block only after the conviction gate, so a stale veto from
+        # an earlier window made evaluate_entry log "MTF BLOCK" for windows the
+        # conviction gate actually killed.
+        self.last_mtf_block = None
+        self.last_conviction_veto = None
+
         # No-trade gates (apply to all entry variants)
-        if atr > DC_ATR_MAX_PCT:
+        if atr > atr_max:
             return None                                   # Burst volatility / whipsaw
-        if spread_cents > DC_MAX_SPREAD_CENTS:
+        if spread_cents > spread_max:
             return None                                   # Spread too wide
         # Conviction gate: chop (|score| < MTF_MIN_TRADE_SCORE) produced 50% WR /
         # negative P&L in the 7-day backtest — sit those windows out entirely.
-        if MTF_ENABLED and MTF_MIN_TRADE_SCORE > 0 and abs(mtf_score) < MTF_MIN_TRADE_SCORE:
+        if MTF_ENABLED and min_trade_score > 0 and abs(mtf_score) < min_trade_score:
+            self.last_conviction_veto = (mtf_score, min_trade_score)
             return None
 
         delta = (price - strike) / strike if strike > 0 else 0.0
-        self.last_mtf_block = None
 
         # MTF counter-trend gate: don't buy the side the higher timeframes oppose
         def fights_trend(side: str) -> bool:
-            blocked = (MTF_ENABLED and MTF_COUNTER_TREND_BLOCK
+            blocked = (MTF_ENABLED and ct_block
                        and mtf_bias in ("UP", "DOWN") and side != mtf_bias)
             if blocked:
                 self.last_mtf_block = side
             return blocked
 
         # MTF trend strength relaxers
-        strong_up = MTF_ENABLED and mtf_score >= MTF_STRONG_SCORE
-        strong_down = MTF_ENABLED and mtf_score <= -MTF_STRONG_SCORE
+        strong_up = MTF_ENABLED and mtf_score >= strong_score
+        strong_down = MTF_ENABLED and mtf_score <= -strong_score
         in_dead_zone = DC_DEAD_ZONE[0] <= k <= DC_DEAD_ZONE[1]
 
         # Momentum scalp variant: minutes 1-3 of window, price already moving
-        if DC_SCALP_ENABLED and DC_SCALP_WINDOW_MIN[0] <= mins_left <= DC_SCALP_WINDOW_MIN[1]:
+        if scalp_enabled and scalp_window[0] <= mins_left <= scalp_window[1]:
             if in_dead_zone and not (strong_up or strong_down):
                 return None
-            if abs(delta) >= DC_SCALP_MIN_MOVE_PCT and abs(delta) <= DC_MAX_DELTA_PCT:
-                if (delta > 0 and k > DC_SCALP_K_UP and k >= d and ask_up <= DC_SCALP_MAX_PRICE
+            if abs(delta) >= scalp_min_move and abs(delta) <= max_delta:
+                if (delta > 0 and k > scalp_k_up and k >= d and ask_up <= scalp_max_price
                         and not fights_trend("UP")):
-                    return EntryDecision("UP", f"scalp delta={delta:.4%} K={k:.0f} mtf={mtf_score:+.2f}", DC_SCALP_SIZE_MULT)
-                if (delta < 0 and k < DC_SCALP_K_DOWN and k <= d and ask_down <= DC_SCALP_MAX_PRICE
+                    return EntryDecision("UP", f"scalp delta={delta:.4%} K={k:.0f} mtf={mtf_score:+.2f}", scalp_size_mult)
+                if (delta < 0 and k < scalp_k_down and k <= d and ask_down <= scalp_max_price
                         and not fights_trend("DOWN")):
-                    return EntryDecision("DOWN", f"scalp delta={delta:.4%} K={k:.0f} mtf={mtf_score:+.2f}", DC_SCALP_SIZE_MULT)
+                    return EntryDecision("DOWN", f"scalp delta={delta:.4%} K={k:.0f} mtf={mtf_score:+.2f}", scalp_size_mult)
             return None  # Outside scalp conditions in early window = no trade
 
         # Core entry: 3-8 minutes remaining
-        lo, hi = DC_ENTRY_WINDOW_MIN
+        lo, hi = entry_window
         if not (lo <= mins_left <= hi):
             return None
-        if abs(delta) < DC_MIN_DELTA_PCT:
+        if abs(delta) < min_delta:
             return None
 
         # Trend-aligned relaxation: with a strong MTF tailwind the delta cap
         # widens (0.10% -> MTF_TREND_MAX_DELTA_PCT) and the StochRSI dead zone
         # is waived. Counter-trend entries keep the strict 0.10% cap.
-        max_delta_up = MTF_TREND_MAX_DELTA_PCT if strong_up else DC_MAX_DELTA_PCT
-        max_delta_down = MTF_TREND_MAX_DELTA_PCT if strong_down else DC_MAX_DELTA_PCT
+        max_delta_up = trend_max_delta if strong_up else max_delta
+        max_delta_down = trend_max_delta if strong_down else max_delta
 
         # UP core entry
-        if delta >= DC_MIN_DELTA_PCT and delta <= max_delta_up and not fights_trend("UP"):
-            k_ok = (k > DC_STOCH_K_LONG_MIN and (not DC_REQUIRE_K_GT_D or k >= d)) and not in_dead_zone
+        if delta >= min_delta and delta <= max_delta_up and not fights_trend("UP"):
+            k_ok = (k > stoch_k_long_min and (not require_k_gt_d or k >= d)) and not in_dead_zone
             k_ok = k_ok or (strong_up and k > DC_DEAD_ZONE[0])  # trend override: K just needs to lean up
-            relaxed = delta > DC_MAX_DELTA_PCT or (in_dead_zone and strong_up)
-            price_cap = MTF_TREND_MAX_PRICE if relaxed else DC_MAX_ENTRY_PRICE
+            relaxed = delta > max_delta or (in_dead_zone and strong_up)
+            price_cap = trend_max_price if relaxed else max_entry_price
             if k_ok and ask_up <= price_cap:
-                mult = MTF_TREND_SIZE_MULT if relaxed else 1.0
+                mult = trend_size_mult if relaxed else 1.0
                 tag = "trend" if relaxed else "core"
                 return EntryDecision("UP", f"{tag} delta={delta:.4%} K={k:.0f}>=D={d:.0f} "
                                            f"ask={ask_up:.2f} mtf={mtf_score:+.2f}[{mtf_detail}]", mult)
 
         # DOWN core entry
-        if delta <= -DC_MIN_DELTA_PCT and delta >= -max_delta_down and not fights_trend("DOWN"):
-            k_ok = (k < (100 - DC_STOCH_K_LONG_MIN) and (not DC_REQUIRE_K_GT_D or k <= d)) and not in_dead_zone
+        if delta <= -min_delta and delta >= -max_delta_down and not fights_trend("DOWN"):
+            k_ok = (k < (100 - stoch_k_long_min) and (not require_k_gt_d or k <= d)) and not in_dead_zone
             k_ok = k_ok or (strong_down and k < DC_DEAD_ZONE[1])  # trend override: K just needs to lean down
-            relaxed = abs(delta) > DC_MAX_DELTA_PCT or (in_dead_zone and strong_down)
-            price_cap = MTF_TREND_MAX_PRICE if relaxed else DC_MAX_ENTRY_PRICE
+            relaxed = abs(delta) > max_delta or (in_dead_zone and strong_down)
+            price_cap = trend_max_price if relaxed else max_entry_price
             if k_ok and ask_down <= price_cap:
-                mult = MTF_TREND_SIZE_MULT if relaxed else 1.0
+                mult = trend_size_mult if relaxed else 1.0
                 tag = "trend" if relaxed else "core"
                 return EntryDecision("DOWN", f"{tag} delta={delta:.4%} K={k:.0f}<D={d:.0f} "
                                              f"ask={ask_down:.2f} mtf={mtf_score:+.2f}[{mtf_detail}]", mult)
@@ -1345,7 +1441,15 @@ class KalshiTradingBot:
             decision = self.engines[asset].delta_capture(
                 price, strike, mins_left, snap["up_ask"] or snap["up"],
                 snap["down_ask"] or snap["down"], spread * 100, mtf=mtf)
-            if decision is None and self.engines[asset].last_mtf_block:
+            if decision is None and self.engines[asset].last_conviction_veto is not None:
+                # Conviction gate vetoed (|score| too low = chop). Distinct log
+                # path from the counter-trend block below (v0.4.0 conflated them
+                # via a stale last_mtf_block).
+                veto_score, veto_thr = self.engines[asset].last_conviction_veto
+                self.log_once(f"{asset}|MTFGATE{snap['ticker']}",
+                              f"{asset} MTF GATE | score {veto_score:+.2f} below conviction "
+                              f"threshold {veto_thr:.2f} — sitting out chop ({mtf[2]})")
+            elif decision is None and self.engines[asset].last_mtf_block:
                 # Log only when the counter-trend gate actually vetoed an
                 # otherwise-qualifying signal — not on every signal-less window.
                 blocked_side = self.engines[asset].last_mtf_block
@@ -1391,8 +1495,9 @@ class KalshiTradingBot:
 
         if not decision:
             return
-        if spread > 0 and spread * 100 > DC_MAX_SPREAD_CENTS:
-            self.log_once(f"{asset}|SPREAD", f"{asset} spread {spread*100:.0f}c > {DC_MAX_SPREAD_CENTS}c")
+        spread_max = asset_param(asset, "DC_MAX_SPREAD_CENTS")
+        if spread > 0 and spread * 100 > spread_max:
+            self.log_once(f"{asset}|SPREAD", f"{asset} spread {spread*100:.0f}c > {spread_max}c")
             return
 
         entry_ask = (snap["up_ask"] or snap["up"]) if decision.side == "UP" else (snap["down_ask"] or snap["down"])
@@ -1519,12 +1624,14 @@ class KalshiTradingBot:
 
         if use_dc:
             # Delta Capture: hold to settlement; optional salvage exit on delta flip
-            if (DC_SALVAGE_EXIT and strike and price > 0
-                    and mins_left > DC_SALVAGE_MIN_MINUTES
-                    and hold >= DC_SALVAGE_MIN_HOLD_S):
+            salvage_on = asset_param(asset, "DC_SALVAGE_EXIT")
+            salvage_min_flip = asset_param(asset, "DC_SALVAGE_MIN_FLIP_PCT")
+            if (salvage_on and strike and price > 0
+                    and mins_left > asset_param(asset, "DC_SALVAGE_MIN_MINUTES")
+                    and hold >= asset_param(asset, "DC_SALVAGE_MIN_HOLD_S")):
                 delta = (price - strike) / strike
-                flipped = ((pos.side == "UP" and delta < -DC_SALVAGE_MIN_FLIP_PCT)
-                           or (pos.side == "DOWN" and delta > DC_SALVAGE_MIN_FLIP_PCT))
+                flipped = ((pos.side == "UP" and delta < -salvage_min_flip)
+                           or (pos.side == "DOWN" and delta > salvage_min_flip))
                 if flipped:
                     self.log(f"{asset} SALVAGE EXIT | delta flipped to {delta:.4%}")
                     return do_close("DELTA_FLIP_SALVAGE")
@@ -1568,7 +1675,7 @@ class KalshiTradingBot:
         width = 68
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         lines = ["+" + "-" * width + "+",
-                 f"|  kalshi-trading-bot v0.4.0  |  {now:<33}|",
+                 f"|  kalshi-trading-bot v0.5.0  |  {now:<33}|",
                  "+" + "-" * width + "+"]
         mode = "LIVE" if self.live_orders else "PAPER"
         wr = self.daily_wins / max(1, self.daily_trades) * 100
@@ -1603,18 +1710,23 @@ class KalshiTradingBot:
     # ------------------------------ run loop ------------------------------
     def run(self):
         self.log("=" * 60)
-        self.log(f"kalshi-trading-bot v0.4.0 | Strategy: {STRATEGY}")
+        self.log(f"kalshi-trading-bot v0.5.0 | Strategy: {STRATEGY}")
         self.log(f"Mode: {'LIVE ORDERS' if self.live_orders else 'PAPER/TEST'} | Assets: {ASSETS}")
         self.log(f"Delta Capture: window {DC_ENTRY_WINDOW_MIN}m | delta {DC_MIN_DELTA_PCT:.4%}-{DC_MAX_DELTA_PCT:.4%} "
                  f"| max entry ${DC_MAX_ENTRY_PRICE} | ATR cap {DC_ATR_MAX_PCT:.4%} | spread cap {DC_MAX_SPREAD_CENTS}c")
+        self.log(f"Scalp: {'on' if DC_SCALP_ENABLED else 'off'} window {DC_SCALP_WINDOW_MIN}m | "
+                 f"max ${DC_SCALP_MAX_PRICE} | size x{DC_SCALP_SIZE_MULT} | salvage: {'on' if DC_SALVAGE_EXIT else 'off'}")
         self.log(f"Risk: daily loss ${MAX_DAILY_LOSS} | drawdown {MAX_DRAWDOWN_PERCENT}% | "
-                 f"{MAX_CONSECUTIVE_LOSSES} straight losses -> {PAUSE_AFTER_LOSS_STREAK_MIN}m pause | size cap {MAX_ORDER_SIZE}")
+                 f"{MAX_CONSECUTIVE_LOSSES} straight losses -> {PAUSE_AFTER_LOSS_STREAK_MIN}m pause "
+                 f"| size {ORDER_SIZE} (cap {MAX_ORDER_SIZE}) | bankroll ${BANKROLL:.0f} | profit target ${PROFIT_TARGET}")
         if MTF_ENABLED:
             tfs = "/".join(MTF_TIMEFRAMES.keys())
             self.log(f"MTF momentum: {tfs} | block counter-trend: {MTF_COUNTER_TREND_BLOCK} | "
                      f"min trade score {MTF_MIN_TRADE_SCORE} | strong >= {MTF_STRONG_SCORE} "
                      f"(delta cap {MTF_TREND_MAX_DELTA_PCT:.4%}, max ${MTF_TREND_MAX_PRICE}, "
                      f"size x{MTF_TREND_SIZE_MULT})")
+        if ASSET_OVERRIDES:
+            self.log(f"Asset overrides: {json.dumps(ASSET_OVERRIDES)}")
         self.log("=" * 60)
         try:
             while self.running:
@@ -1733,17 +1845,128 @@ def load_api_keys_from_dir() -> Tuple[str, str]:
     return api_key, pk_path
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Full CLI. Every flag maps to a module-global config variable; flags take
+    precedence over the script defaults (which stay the documented baseline)."""
+    p = argparse.ArgumentParser(
+        description="kalshi-trading-bot v0.5.0 — Kalshi 15-min crypto up/down bot",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--strategy", choices=["delta_capture", "delta_capture_scalp", "rsi_extreme",
+                                          "multi_tf_confluence", "mean_reversion",
+                                          "momentum_breakout", "divergence_play"],
+                   help="Entry strategy (STRATEGY)")
+    p.add_argument("--assets", help="Comma list of assets, e.g. BTC,ETH (ASSETS)")
+    p.add_argument("--paper", action="store_true", help="Force paper/test mode")
+    p.add_argument("--force-paper", action="store_true",
+                   help="Force paper mode persistently (FORCE_PAPER_MODE=True)")
+    p.add_argument("--pretty", action="store_true", help="Live terminal dashboard")
+    p.add_argument("--api-base", help="Kalshi API base URL (KALSHI_API_BASE)")
+    p.add_argument("--dc-window", nargs=2, type=float, metavar=("LO", "HI"),
+                   help="Core entry window, minutes left (DC_ENTRY_WINDOW_MIN)")
+    p.add_argument("--dc-min-delta", type=float, help="Min |delta| fraction (DC_MIN_DELTA_PCT)")
+    p.add_argument("--dc-max-delta", type=float, help="Max |delta| fraction (DC_MAX_DELTA_PCT)")
+    p.add_argument("--dc-max-entry-price", type=float, help="Core max entry price (DC_MAX_ENTRY_PRICE)")
+    p.add_argument("--dc-atr-max-pct", type=float, help="Global 1m ATR%% cap (DC_ATR_MAX_PCT)")
+    p.add_argument("--dc-scalp-max-price", type=float, help="Scalp max entry price (DC_SCALP_MAX_PRICE)")
+    p.add_argument("--dc-scalp", dest="dc_scalp", action="store_true", default=None,
+                   help="Enable scalp entries (DC_SCALP_ENABLED=True)")
+    p.add_argument("--no-dc-scalp", dest="dc_scalp", action="store_false", default=None,
+                   help="Disable scalp entries (DC_SCALP_ENABLED=False)")
+    p.add_argument("--mtf-min-trade-score", type=float, help="MTF conviction gate (MTF_MIN_TRADE_SCORE)")
+    p.add_argument("--mtf-strong-score", type=float, help="MTF strong-trend threshold (MTF_STRONG_SCORE)")
+    p.add_argument("--mtf-min-score", type=float, help="MTF NEUTRAL-zone half-width (MTF_MIN_SCORE)")
+    p.add_argument("--counter-trend-block", dest="counter_trend_block", action="store_true",
+                   default=None, help="Block entries against the MTF bias")
+    p.add_argument("--no-counter-trend-block", dest="counter_trend_block", action="store_false", default=None,
+                   help="Allow counter-trend entries")
+    p.add_argument("--order-size", type=int, help="Contracts per trade (ORDER_SIZE)")
+    p.add_argument("--max-order-size", type=int, help="Hard size cap (MAX_ORDER_SIZE)")
+    p.add_argument("--bankroll", type=float, help="Fallback bankroll $ (BANKROLL)")
+    p.add_argument("--max-daily-loss", type=float, help="Daily loss halt $ (MAX_DAILY_LOSS)")
+    p.add_argument("--max-drawdown-pct", type=float, help="Drawdown halt %% (MAX_DRAWDOWN_PERCENT)")
+    p.add_argument("--profit-target", type=float, help="Take-profit price (PROFIT_TARGET)")
+    p.add_argument("--salvage", dest="salvage", action="store_true", default=None,
+                   help="Enable delta-flip salvage exits (DC_SALVAGE_EXIT=True)")
+    p.add_argument("--no-salvage", dest="salvage", action="store_false", default=None,
+                   help="Disable salvage exits (DC_SALVAGE_EXIT=False)")
+    p.add_argument("--asset-overrides",
+                   help="Per-asset overrides as JSON, e.g. "
+                        '\'{"ETH":{"MTF_MIN_TRADE_SCORE":0.15}}\' (ASSET_OVERRIDES)')
+    return p
+
+
+def apply_cli_overrides(args: argparse.Namespace) -> List[str]:
+    """Map parsed args onto module globals BEFORE bot construction.
+    Returns a human-readable list of applied overrides for the startup log."""
+    applied = []
+
+    def setg(name, value, label=None):
+        globals()[name] = value
+        applied.append(f"{name}={value}" + (f" ({label})" if label else ""))
+
+    if args.strategy is not None:
+        setg("STRATEGY", args.strategy)
+    if args.assets is not None:
+        assets = [a.strip().upper() for a in args.assets.split(",") if a.strip()]
+        unknown = [a for a in assets if a not in ASSET_SERIES_MAP]
+        if unknown:
+            raise SystemExit(f"--assets: unknown asset(s) {unknown}; valid: {sorted(ASSET_SERIES_MAP)}")
+        if not assets:
+            raise SystemExit("--assets: empty list")
+        setg("ASSETS", assets)  # bot feeds/engines/states are built from this
+    if args.api_base is not None:
+        setg("KALSHI_API_BASE", args.api_base)
+    if args.dc_window is not None:
+        lo, hi = args.dc_window
+        if not (0 <= lo < hi <= 15):
+            raise SystemExit("--dc-window: need 0 <= LO < HI <= 15")
+        setg("DC_ENTRY_WINDOW_MIN", (lo, hi))
+    for arg_name, glob_name in [
+            ("dc_min_delta", "DC_MIN_DELTA_PCT"), ("dc_max_delta", "DC_MAX_DELTA_PCT"),
+            ("dc_max_entry_price", "DC_MAX_ENTRY_PRICE"), ("dc_atr_max_pct", "DC_ATR_MAX_PCT"),
+            ("dc_scalp_max_price", "DC_SCALP_MAX_PRICE"),
+            ("mtf_min_trade_score", "MTF_MIN_TRADE_SCORE"),
+            ("mtf_strong_score", "MTF_STRONG_SCORE"), ("mtf_min_score", "MTF_MIN_SCORE"),
+            ("order_size", "ORDER_SIZE"), ("max_order_size", "MAX_ORDER_SIZE"),
+            ("bankroll", "BANKROLL"), ("max_daily_loss", "MAX_DAILY_LOSS"),
+            ("max_drawdown_pct", "MAX_DRAWDOWN_PERCENT"), ("profit_target", "PROFIT_TARGET")]:
+        val = getattr(args, arg_name)
+        if val is not None:
+            setg(glob_name, val)
+    if args.dc_scalp is not None:
+        setg("DC_SCALP_ENABLED", args.dc_scalp)
+    if args.counter_trend_block is not None:
+        setg("MTF_COUNTER_TREND_BLOCK", args.counter_trend_block)
+    if args.salvage is not None:
+        setg("DC_SALVAGE_EXIT", args.salvage)
+    if args.force_paper:
+        setg("FORCE_PAPER_MODE", True)
+    if args.asset_overrides is not None:
+        try:
+            ov = json.loads(args.asset_overrides)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"--asset-overrides: invalid JSON: {e}")
+        if not isinstance(ov, dict) or not all(isinstance(v, dict) for v in ov.values()):
+            raise SystemExit("--asset-overrides: must be a JSON object of {asset: {PARAM: value}}")
+        unknown = [a for a in ov if a not in ASSET_SERIES_MAP]
+        if unknown:
+            raise SystemExit(f"--asset-overrides: unknown asset(s) {unknown}")
+        setg("ASSET_OVERRIDES", ov)
+    return applied
+
+
 def main():
     global PRETTY_DISPLAY
-    parser = argparse.ArgumentParser(description="kalshi-trading-bot v0.4.0")
-    parser.add_argument("--paper", action="store_true", help="Force paper/test mode")
-    parser.add_argument("--pretty", action="store_true", help="Live terminal dashboard")
-    args = parser.parse_args()
+    args = build_arg_parser().parse_args()
+    cli_overrides = apply_cli_overrides(args)  # sets module globals pre-construction
     if args.pretty:
         PRETTY_DISPLAY = True
+        cli_overrides.append("PRETTY_DISPLAY=True")
 
     logger, log_file, trade_file, perf_file = setup_logging(pretty_display=PRETTY_DISPLAY)
     logger.info(f"Log: {log_file} | Trades: {trade_file} | Perf: {perf_file}")
+    if cli_overrides:
+        logger.info(f"CLI override: {' | '.join(cli_overrides)}")
 
     api_key, pk_path = load_api_keys_from_dir()
     have_keys = bool(api_key) and bool(pk_path)
