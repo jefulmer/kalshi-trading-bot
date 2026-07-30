@@ -1,8 +1,12 @@
 {
-  "_comment": "kalshi-trading-bot config file. Precedence: script defaults < this file < CLI flags. Edit via 'python3 kalshi_trading_bot.py --menu' or by hand. Only keys that differ from script defaults need to be here; delete a key to revert it to the script default. Shipped v0.6.0 values: enables two 'shots on goal' per 15-min window (v0.6.0 feature); entry tuning itself lives in the script's calibrated ASSET_OVERRIDES (30d backtest) — override per-asset here only with new evidence.",
+  "_comment": "kalshi-trading-bot config file. Precedence: script defaults < this file < CLI flags. Only values that differ from the script defaults are stored here. Edit via: python3 kalshi_trading_bot.py --menu",
   "MAX_ENTRIES_PER_WINDOW": 2,
   "REENTRY_COOLDOWN_SECONDS": 120,
   "REENTRY_SIZE_DECAY": 0.5,
   "REENTRY_SAME_SIDE_ALLOWED": false,
-  "REENTRY_AFTER_LOSS_ONLY": false
+  "REENTRY_AFTER_LOSS_ONLY": false,
+  "MARKET_HEALTH_ENABLED": true,
+  "FEED_STALE_SECONDS": 45,
+  "MAINTENANCE_WINDOWS": [["3", "05:00", "08:00"]],
+  "_maintenance_note": "Kalshi weekly maintenance: user reports scheduled 3-5am with overruns to ~7:30am; log evidence showed zero prices 05:22-06:30 UTC on Thursday 2026-07-30 (weekday 3, Mon=0). The 05:00-08:00 UTC Thursday blackout covers the observed window plus margin. Dynamic zero-price detection (MARKET_HEALTH_ENABLED) is the real guard and also handles overruns — this blackout is belt-and-braces. Adjust the window to your exchange notice if the schedule differs; set [] to disable."
 }
