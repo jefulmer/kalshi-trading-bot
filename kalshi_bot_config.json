@@ -1,0 +1,8 @@
+{
+  "_comment": "kalshi-trading-bot config file. Precedence: script defaults < this file < CLI flags. Edit via 'python3 kalshi_trading_bot.py --menu' or by hand. Only keys that differ from script defaults need to be here; delete a key to revert it to the script default. Shipped v0.6.0 values: enables two 'shots on goal' per 15-min window (v0.6.0 feature); entry tuning itself lives in the script's calibrated ASSET_OVERRIDES (30d backtest) — override per-asset here only with new evidence.",
+  "MAX_ENTRIES_PER_WINDOW": 2,
+  "REENTRY_COOLDOWN_SECONDS": 120,
+  "REENTRY_SIZE_DECAY": 0.5,
+  "REENTRY_SAME_SIDE_ALLOWED": false,
+  "REENTRY_AFTER_LOSS_ONLY": false
+}
