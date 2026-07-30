@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kalshi-trading-bot (v0.6.0)
+kalshi-trading-bot (v0.7.0)
 ===========================
 Automated trading bot for Kalshi 15-minute crypto up/down markets
 (default: BTC, series KXBTC15M).
@@ -27,6 +27,50 @@ MODES:
   - Set FORCE_PAPER_MODE = True to override and always paper-trade.
 
 CHANGELOG:
+  v0.7.0 (2026-07-31):
+    - FIX (CRITICAL, paper P&L): phantom fills during Kalshi maintenance.
+      2026-07-30 05:22-06:30 UTC the orderbook returned zero prices and the
+      bot booked 14 paper entries at 0.00 that "settled" as fake +$1.00 wins
+      (+$10.15 of the day's +$9.67 was maintenance noise). NEW market-health
+      layer (MARKET_HEALTH_ENABLED, default on):
+        * PriceFeed.last_success_ts + is_stale() (FEED_STALE_SECONDS, 45s).
+        * get_snapshot adds snap["healthy"] (status in KALSHI_TRADING_STATUSES
+          AND a positive ask or price on BOTH sides).
+        * evaluate_entry vetoes ALL strategies on non-trading status, empty
+          book, stale feed, or a scheduled MAINTENANCE_WINDOWS UTC blackout
+          (throttled log per asset + one "MARKET HEALTHY — resuming" line
+          on recovery); defense-in-depth ask>0 hard gate at entry resolution.
+        * delta_capture returns no-decision on ask<=0; manage_position skips
+          exit evaluation when the book price is 0 (holds the position);
+          paper close_position never synthesizes floor-price exits against an
+          empty book.
+      Set MARKET_HEALTH_ENABLED=False to disable the veto/staleness/blackout
+      layer; the delta_capture zero-ask guard stays on regardless (safety).
+    - NEW: HYPE price feed. Binance has no HYPEUSDT spot (400s all session
+      2026-07-30; the MTF gate vetoed every HYPE entry). Per-asset kline
+      routing via ASSET_FEED_MAP: HYPE klines come from the Hyperliquid info
+      API (candleSnapshot, 1m-1d); spot poll falls back Kraken -> Hyperliquid
+      allMids -> Binance. NEW generic Kraken OHLC fallback in _fetch_klines
+      for ALL assets when Binance fails (hardens every asset against Binance
+      outages). Conservative model-derived HYPE overrides (paper-only until
+      >=20 fills): ATR cap 0.0015, min-delta 0.0006, max entry 0.58.
+    - NEW: MAINTENANCE_WINDOWS config (default []). Optional UTC entry
+      blackout windows [[weekday, "HH:MM", "HH:MM"], ...] (weekday 0=Mon).
+      Dynamic zero-price detection is the primary guard; the blackout is
+      belt-and-braces for scheduled maintenance. Shipped config sets
+      [["3", "05:00", "08:00"]] (Thursday 05:00-08:00 UTC, observed Kalshi
+      weekly maintenance incl. overruns).
+    - FIX (cosmetic): strike prints use .4g instead of .0f (DOGE/XRP/NEAR
+      strikes no longer display as ~0/~1/~2).
+    - VERSION module constant now drives all version strings.
+    - HOTFIX (2026-07-31, health gate false positive): the gate required
+      status=="open", but Kalshi market OBJECTS report status="active" while
+      trading (the GET /markets?status=open FILTER maps to "active" objects;
+      enum: initialized|inactive|active|closed|determined|disputed|amended|
+      finalized). Every live market was being vetoed as "maintenance". Now
+      KALSHI_TRADING_STATUSES=("active","open") and the unavailable log
+      distinguishes MARKET NOT TRADING (bad status) from BOOK EMPTY (trading
+      status, no usable quotes). Zero prices are still never traded.
   v0.6.0 (2026-07-30):
     - NEW: JSON config file support with a strict precedence chain:
       script defaults < config file < CLI flags. Default path
@@ -238,6 +282,8 @@ except ImportError:
     print("ERROR: pip install requests")
     sys.exit(1)
 
+VERSION = "0.7.0"   # single source of truth for all version strings (v0.7.0)
+
 # ============================================================================
 # CONFIGURATION — EDIT THESE VARIABLES TO TUNE THE BOT (no config file needed)
 # ============================================================================
@@ -252,6 +298,11 @@ STRATEGY = "delta_capture"        # "delta_capture" (default, recommended),
 ASSETS = ["BTC"]                  # Any of: BTC ETH SOL XRP DOGE HYPE BNB NEAR ZEC
 KALSHI_API_BASE = "https://external-api.kalshi.com"   # Production API
 # KALSHI_API_BASE = "https://demo-api.kalshi.co"      # Uncomment for Kalshi demo
+# Statuses in which a market object is tradeable. Kalshi docs: market.status
+# enum = initialized|inactive|active|closed|determined|disputed|amended|finalized;
+# "active" = open for trading (the GET /markets?status=open FILTER maps to
+# status="active" objects). "open" kept for tolerance of older responses.
+KALSHI_TRADING_STATUSES = ("active", "open")
 
 # --- API keys (read from subfolder) ---
 API_KEYS_DIR = "api_keys"         # Folder holding apikey.json / privatekey.json
@@ -397,6 +448,21 @@ PRICE_POLL_SECONDS = 8            # 1m price feed poll (handoff suggests 5-10s)
 MARKET_REFRESH_MS = 5000          # Kalshi market snapshot cache
 KLINES_CACHE_TTL_S = 30           # Exchange kline cache
 BALANCE_CACHE_TTL_S = 60          # Balance cache
+
+# --- Market health (v0.7.0) — maintenance / zero-price / stale-feed guards ---
+# Root cause: during Kalshi weekly maintenance the orderbook returns zero
+# prices; v0.6.0 booked paper entries at 0.00 that settled as fake +$1.00
+# wins (14 phantom trades 2026-07-30 05:22-06:30 UTC). These guards veto
+# entries on closed/empty markets and stale feeds, and block exit/settlement
+# evaluation against zero prices. False disables veto/staleness/blackout; the
+# delta_capture zero-ask guard itself is always on (strictly protective).
+MARKET_HEALTH_ENABLED = True      # Master switch for all market-health guards
+FEED_STALE_SECONDS = 45           # No successful spot fetch for this long = stale feed, veto entries
+MAINTENANCE_WINDOWS = []          # Optional scheduled UTC entry blackouts:
+                                  # [[weekday, "HH:MM", "HH:MM"], ...] weekday 0=Mon..6=Sun.
+                                  # Dynamic zero-price detection is the primary guard (it also
+                                  # handles overruns); windows are belt-and-braces for scheduled
+                                  # maintenance, e.g. [["3", "05:00", "08:00"]] = Thu 05:00-08:00 UTC.
 PRETTY_DISPLAY = False            # True = live terminal dashboard
 
 # ============================================================================
@@ -415,6 +481,9 @@ ASSET_SYMBOL_MAP = {   # Exchange spot symbols (Kraken pair, Binance symbol)
     "BNB": ("BNBUSD", "BNBUSDT"),
     "NEAR": ("NEARUSD", "NEARUSDT"), "ZEC": ("ZECUSD", "ZECUSDT"),
 }
+ASSET_FEED_MAP = {   # Per-asset kline source routing (v0.7.0). Unlisted assets
+    "HYPE": "hyperliquid",   # use the existing Binance-first / Kraken-fallback
+}                            # path. Binance has no HYPEUSDT spot (400s).
 
 # --- Per-asset parameter overrides (v0.5.0) ---
 # Any entry-tunable global can be overridden per asset here; the engine
@@ -423,7 +492,10 @@ ASSET_SYMBOL_MAP = {   # Exchange spot symbols (Kraken pair, Binance symbol)
 # The 1m ATR% level diverges ~2x across assets, so a single global ATR cap
 # either strangles high-vol assets or protects low-vol ones too little.
 # Caps below ~= p75 of each asset's 24h ATR% distribution (block the burstiest
-# quartile only). HYPE has no Binance spot feed — untested, no override.
+# quartile only). HYPE (v0.7.0): no Binance spot feed — klines route to
+# Hyperliquid (ASSET_FEED_MAP); overrides below are model-derived guesses
+# (ATR cap/min-delta borrowed from the comparable high-vol assets, price cap
+# from the NEAR/ZEC newcomer rule). Paper-only until >=20 real fills.
 ASSET_OVERRIDES = {
     # ATR caps = p75 of each asset's 30d 1m ATR% distribution (2026-06-30..07-30).
     # Min-delta overrides = best cell in the 30d per-asset sweep (0.0002/0.0004/
@@ -438,6 +510,9 @@ ASSET_OVERRIDES = {
     "BNB":  {"DC_ATR_MAX_PCT": 0.0006},
     "NEAR": {"DC_ATR_MAX_PCT": 0.0015, "DC_MIN_DELTA_PCT": 0.0006, "DC_MAX_ENTRY_PRICE": 0.58},
     "ZEC":  {"DC_ATR_MAX_PCT": 0.0018, "DC_MAX_ENTRY_PRICE": 0.58},
+    # HYPE: model-derived guess (no backtest data — no Binance spot history).
+    # Conservative newcomer treatment like NEAR/ZEC. Paper-only until >=20 fills.
+    "HYPE": {"DC_ATR_MAX_PCT": 0.0015, "DC_MIN_DELTA_PCT": 0.0006, "DC_MAX_ENTRY_PRICE": 0.58},
 }
 
 
@@ -508,6 +583,8 @@ CONFIG_SETTABLE = {
     "POLL_INTERVAL_MONITORING_S", "POLL_INTERVAL_RELAXED_S", "PRICE_POLL_SECONDS",
     "MARKET_REFRESH_MS", "KLINES_CACHE_TTL_S", "BALANCE_CACHE_TTL_S",
     "PRETTY_DISPLAY",
+    # Market health (v0.7.0)
+    "MARKET_HEALTH_ENABLED", "FEED_STALE_SECONDS", "MAINTENANCE_WINDOWS",
     # Per-asset overrides
     "ASSET_OVERRIDES",
 }
@@ -550,6 +627,74 @@ def _coerce_config_value(value, default):
     except (TypeError, ValueError):
         return False, None
     return False, None
+
+
+def _hhmm_to_min(s) -> Optional[int]:
+    """Parse "HH:MM" (UTC) to minutes since midnight. None if invalid."""
+    if not isinstance(s, str):
+        return None
+    m = s.strip().split(":")
+    if len(m) != 2:
+        return None
+    try:
+        h, mi = int(m[0]), int(m[1])
+    except ValueError:
+        return None
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    return h * 60 + mi
+
+
+def _coerce_maintenance_windows(value):
+    """Validate MAINTENANCE_WINDOWS JSON: a list of [weekday, "HH:MM", "HH:MM"]
+    (weekday 0=Mon..6=Sun, UTC). Weekday may be an int or a digit string.
+    Returns (ok, normalized [[int, "HH:MM", "HH:MM"], ...]). Never raises."""
+    if not isinstance(value, list):
+        return False, None
+    out = []
+    try:
+        for w in value:
+            if not isinstance(w, (list, tuple)) or len(w) != 3:
+                return False, None
+            wd, start, end = w
+            if isinstance(wd, bool):
+                return False, None
+            if isinstance(wd, str) and wd.strip().isdigit():
+                wd = int(wd.strip())
+            if not isinstance(wd, int) or not (0 <= wd <= 6):
+                return False, None
+            st, en = _hhmm_to_min(start), _hhmm_to_min(end)
+            if st is None or en is None or st == en:
+                return False, None
+            out.append([wd, f"{st // 60:02d}:{st % 60:02d}", f"{en // 60:02d}:{en % 60:02d}"])
+    except Exception:
+        return False, None
+    return True, out
+
+
+def maintenance_blackout_end(now: Optional[datetime] = None) -> Optional[str]:
+    """If `now` (UTC) is inside a MAINTENANCE_WINDOWS blackout, return the
+    window end "HH:MM" (UTC); else None. Windows may wrap midnight."""
+    if not MAINTENANCE_WINDOWS:
+        return None
+    now = now or datetime.now(timezone.utc)
+    t = now.hour * 60 + now.minute
+    wd = now.weekday()
+    for w in MAINTENANCE_WINDOWS:
+        try:
+            wwd = int(w[0])
+            st, en = _hhmm_to_min(w[1]), _hhmm_to_min(w[2])
+            if st is None or en is None:
+                continue
+            if st < en:
+                if wwd == wd and st <= t < en:
+                    return w[2]
+            else:  # wraps midnight: active on the start weekday's evening and the next morning
+                if (wwd == wd and t >= st) or ((wwd + 1) % 7 == wd and t < en):
+                    return w[2]
+        except Exception:
+            continue
+    return None
 
 
 def find_config_file(cli_path: Optional[str]) -> Optional[str]:
@@ -601,7 +746,10 @@ def load_config_file(path: Optional[str]):
         if key not in CONFIG_SETTABLE:
             messages.append((logging.WARNING, f"Config file ({path}): unknown key {key!r} ignored"))
             continue
-        ok, coerced = _coerce_config_value(value, _SCRIPT_DEFAULTS[key])
+        if key == "MAINTENANCE_WINDOWS":
+            ok, coerced = _coerce_maintenance_windows(value)
+        else:
+            ok, coerced = _coerce_config_value(value, _SCRIPT_DEFAULTS[key])
         if not ok:
             messages.append((logging.WARNING,
                              f"Config file ({path}): {key} has wrong type ({value!r}) — skipped"))
@@ -762,7 +910,8 @@ class KalshiAPI:
     def request(self, method: str, endpoint: str, params: dict = None, body: dict = None, authenticated: bool = True) -> dict:
         url = f"{self.api_base}{endpoint}"
         body_str = json.dumps(body) if body else ""
-        headers = {"User-Agent": "kalshi-trading-bot/6.0", "Accept": "application/json", "Content-Type": "application/json"}
+        headers = {"User-Agent": f"kalshi-trading-bot/{VERSION.split('.', 1)[1]}",  # "0.7.0" -> "7.0"
+                   "Accept": "application/json", "Content-Type": "application/json"}
         if authenticated and self.api_key_id:
             timestamp, signature = self._sign_request(method, endpoint)
             headers["KALSHI-ACCESS-KEY"] = self.api_key_id
@@ -877,10 +1026,18 @@ class KalshiAPI:
 class PriceFeed:
     KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
     BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
+    HYPERLIQUID_URL = "https://api.hyperliquid.xyz/info"
+    # v0.7.0: interval maps for the non-Binance kline sources
+    HYPERLIQUID_INTERVALS = {"1m": "1m", "5m": "5m", "15m": "15m",
+                             "1h": "1h", "4h": "4h", "1d": "1d"}
+    HYPERLIQUID_INTERVAL_MS = {"1m": 60000, "5m": 300000, "15m": 900000,
+                               "1h": 3600000, "4h": 14400000, "1d": 86400000}
+    KRAKEN_INTERVAL_CODES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
     def __init__(self, asset: str):
         self.asset = asset
         self.kraken_pair, self.binance_symbol = ASSET_SYMBOL_MAP.get(asset, ("XBTUSD", "BTCUSDT"))
+        self.kline_source = ASSET_FEED_MAP.get(asset, "binance")  # v0.7.0 per-asset routing
         self.session = requests.Session()
         retry = Retry(total=2, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
@@ -889,6 +1046,12 @@ class PriceFeed:
         self._last_poll = 0.0
         self._last_price = 0.0
         self._kline_cache: Dict[str, Tuple[float, Any]] = {}
+        self.last_success_ts = 0.0   # epoch of last successful poll() fetch (v0.7.0, F1)
+
+    def is_stale(self) -> bool:
+        """True if poll() has never succeeded or the last successful fetch is
+        older than FEED_STALE_SECONDS (v0.7.0 market-health gate)."""
+        return self.last_success_ts == 0 or (time.time() - self.last_success_ts) > FEED_STALE_SECONDS
 
     def poll(self) -> float:
         """Poll spot price at most every PRICE_POLL_SECONDS; returns last price."""
@@ -896,7 +1059,11 @@ class PriceFeed:
         if now - self._last_poll < PRICE_POLL_SECONDS:
             return self._last_price
         self._last_poll = now
-        candles = self._fetch_kraken() or self._fetch_binance()
+        candles = self._fetch_kraken()
+        if not candles and self.kline_source == "hyperliquid":
+            candles = self._fetch_hyperliquid_mids()  # HYPE: mids before the (dead) Binance attempt
+        if not candles:
+            candles = self._fetch_binance()
         if candles:
             for c in candles:
                 if not self.candles or c[0] > self.candles[-1][0]:
@@ -904,6 +1071,7 @@ class PriceFeed:
                 elif c[0] == self.candles[-1][0]:
                     self.candles[-1] = c  # Update the still-forming current candle
             self._last_price = self.candles[-1][4]
+            self.last_success_ts = now
         return self._last_price
 
     def _fetch_kraken(self) -> List[Tuple[int, float, float, float, float]]:
@@ -931,6 +1099,21 @@ class PriceFeed:
             logging.getLogger("kalshi_bot").debug(f"Binance fetch failed: {e}")
             return []
 
+    def _fetch_hyperliquid_mids(self) -> List[Tuple[int, float, float, float, float]]:
+        """Hyperliquid allMids spot fallback (v0.7.0, HYPE). allMids returns a
+        coin->price map, so synthesize one flat candle at the current minute."""
+        try:
+            r = self.session.post(self.HYPERLIQUID_URL, json={"type": "allMids"}, timeout=10)
+            r.raise_for_status()
+            px = float(r.json().get(self.asset, 0) or 0)
+            if px <= 0:
+                return []
+            ts = int(time.time()) // 60 * 60
+            return [(ts, px, px, px, px)]
+        except Exception as e:
+            logging.getLogger("kalshi_bot").debug(f"Hyperliquid allMids fetch failed: {e}")
+            return []
+
     def get_klines_15m(self, limit: int = 50) -> List[list]:
         """15-minute klines for legacy strategies (Binance, cached KLINES_CACHE_TTL_S)."""
         key = f"15m:{limit}"
@@ -950,11 +1133,29 @@ class PriceFeed:
 
     # --- Multi-Timeframe Momentum (v0.2.0) ---
     def _fetch_klines(self, interval: str, limit: int) -> List[list]:
-        """Generic Binance kline fetch, cached MTF_CACHE_TTL_S per interval."""
+        """Kline fetch with per-asset source routing (v0.7.0), cached
+        MTF_CACHE_TTL_S per interval. Source order: ASSET_FEED_MAP primary
+        (e.g. Hyperliquid for HYPE) -> Binance -> generic Kraken OHLC ->
+        stale cache. All sources return rows index-compatible with Binance
+        klines: [open_time_ms, open, high, low, close, volume, ...]."""
         key = f"mtf:{interval}:{limit}"
         now = time.time()
         if key in self._kline_cache and now - self._kline_cache[key][0] < MTF_CACHE_TTL_S:
             return self._kline_cache[key][1]
+        data: List[list] = []
+        if self.kline_source == "hyperliquid":
+            data = self._fetch_klines_hyperliquid(interval, limit)
+        if not data:
+            data = self._fetch_klines_binance(interval, limit)
+        if not data:
+            data = self._fetch_klines_kraken(interval, limit)
+        if data:
+            self._kline_cache[key] = (now, data)
+            return data
+        return self._kline_cache.get(key, (0, []))[1]
+
+    def _fetch_klines_binance(self, interval: str, limit: int) -> List[list]:
+        """Binance spot klines (raw string rows, exactly as the API returns)."""
         try:
             r = self.session.get(self.BINANCE_URL,
                                  params={"symbol": self.binance_symbol,
@@ -962,11 +1163,52 @@ class PriceFeed:
                                  timeout=10)
             r.raise_for_status()
             data = r.json()
-            self._kline_cache[key] = (now, data)
-            return data
+            return data if isinstance(data, list) else []
         except Exception as e:
             logging.getLogger("kalshi_bot").debug(f"MTF kline fetch {interval} failed: {e}")
-            return self._kline_cache.get(key, (0, []))[1]
+            return []
+
+    def _fetch_klines_hyperliquid(self, interval: str, limit: int) -> List[list]:
+        """Hyperliquid candleSnapshot (v0.7.0, HYPE primary). Ascending list of
+        {t,T,s,i,o,c,h,l,v,n} with string prices, last candle in-progress.
+        Returned as [open_time_ms, o, h, l, c, v] float rows."""
+        hl_interval = self.HYPERLIQUID_INTERVALS.get(interval)
+        if not hl_interval:
+            return []
+        try:
+            end_ms = int(time.time() * 1000)
+            start_ms = end_ms - (limit + 2) * self.HYPERLIQUID_INTERVAL_MS[hl_interval]
+            body = {"type": "candleSnapshot",
+                    "req": {"coin": self.asset, "interval": hl_interval,
+                            "startTime": start_ms, "endTime": end_ms}}
+            r = self.session.post(self.HYPERLIQUID_URL, json=body, timeout=10)
+            r.raise_for_status()
+            rows = r.json()
+            if not isinstance(rows, list):
+                return []
+            return [[int(c["t"]), float(c["o"]), float(c["h"]), float(c["l"]),
+                     float(c["c"]), float(c.get("v", 0) or 0)] for c in rows[-limit:]]
+        except Exception as e:
+            logging.getLogger("kalshi_bot").debug(f"Hyperliquid kline fetch {interval} failed: {e}")
+            return []
+
+    def _fetch_klines_kraken(self, interval: str, limit: int) -> List[list]:
+        """Generic Kraken OHLC fallback (v0.7.0, all assets). Rows
+        [sec, o, h, l, c, vwap, vol, count] ascending -> [ms, o, h, l, c, v]."""
+        code = self.KRAKEN_INTERVAL_CODES.get(interval)
+        if code is None:
+            return []
+        try:
+            r = self.session.get(self.KRAKEN_URL,
+                                 params={"pair": self.kraken_pair, "interval": code}, timeout=10)
+            r.raise_for_status()
+            result = r.json().get("result", {})
+            rows = result.get(self.kraken_pair) or next((v for k, v in result.items() if k != "last"), [])
+            return [[int(row[0]) * 1000, float(row[1]), float(row[2]), float(row[3]),
+                     float(row[4]), float(row[6])] for row in rows[-limit:]]
+        except Exception as e:
+            logging.getLogger("kalshi_bot").debug(f"Kraken kline fetch {interval} failed: {e}")
+            return []
 
     def momentum_score(self) -> Tuple[float, str, str]:
         """Weighted multi-timeframe momentum.
@@ -1126,6 +1368,11 @@ class StrategyEngine:
         # conviction gate actually killed.
         self.last_mtf_block = None
         self.last_conviction_veto = None
+
+        # Zero-price guard (v0.7.0, F1): an empty/maintenance orderbook quotes
+        # 0.00 asks — never evaluate entries against it (phantom-fill fix).
+        if ask_up <= 0 or ask_down <= 0:
+            return None
 
         # No-trade gates (apply to all entry variants)
         if atr > atr_max:
@@ -1294,6 +1541,7 @@ class AssetState:
     confirmation_count: int = 0
     last_proposed_side: str = ""
     emergency_retries: int = 0
+    market_healthy: bool = True      # v0.7.0 F1: tracks recovery after an unhealthy patch
     price_history: deque = field(default_factory=lambda: deque(maxlen=20))
 
 
@@ -1324,6 +1572,7 @@ class KalshiTradingBot:
         self._pos_cache: Dict[str, Tuple[bool, float]] = {}
         self._balance_cache: Tuple[float, float] = (0.0, 0.0)
         self._snapshot_cache: Dict[str, Tuple[float, dict]] = {}
+        self._throttle_ts: Dict[str, float] = {}   # v0.7.0: per-key throttled log timestamps
         self.display_data: Dict[str, dict] = {}
         self._display_lock = threading.Lock()
         if self.pretty_display:
@@ -1336,6 +1585,14 @@ class KalshiTradingBot:
     def log_once(self, key: str, msg: str):
         if key not in self.log_once_keys:
             self.log_once_keys.add(key)
+            self.log(msg)
+
+    def _throttled_log(self, key: str, msg: str, interval: float = 60.0):
+        """Log at most once per `interval` seconds per key (v0.7.0) — keeps
+        persistent conditions (maintenance, stale feed) from spamming the log."""
+        now = time.time()
+        if now - self._throttle_ts.get(key, 0.0) >= interval:
+            self._throttle_ts[key] = now
             self.log(msg)
 
     def _parse_price(self, v) -> float:
@@ -1392,10 +1649,47 @@ class KalshiTradingBot:
         snap = {"ticker": ticker, "up": up, "down": down,
                 "up_bid": yes_bid, "up_ask": yes_ask, "down_bid": no_bid, "down_ask": no_ask,
                 "minutes_left": self.minutes_left(m.get("close_time", "")),
-                "status": m.get("status", "open"),
+                "status": m.get("status", "active"),
+                # v0.7.0 (F1): healthy only when the market is in a trading
+                # status (Kalshi reports "active" while trading) AND has a
+                # positive ask (or fallback price) on BOTH sides — an empty
+                # maintenance book fails this.
+                "healthy": (m.get("status", "active") in KALSHI_TRADING_STATUSES
+                            and (yes_ask > 0 or up > 0) and (no_ask > 0 or down > 0)),
                 "market_strike": mkt_strike}
         self._snapshot_cache[asset] = (now, snap)
         return snap
+
+    def _market_unhealthy(self, asset: str, snap: dict) -> bool:
+        """v0.7.0 (F1) market-health gate. True = veto all entries this cycle:
+        scheduled maintenance blackout, market not open / zero asks, or a stale
+        spot feed. Logs throttled (<=1/60s per asset) while unhealthy plus one
+        recovery line when the market comes back."""
+        st = self.states[asset]
+        blackout_end = maintenance_blackout_end()
+        reason = ""
+        if blackout_end:
+            reason = f"MAINTENANCE BLACKOUT (scheduled) — entries paused until {blackout_end} UTC"
+        elif snap.get("status", "active") not in KALSHI_TRADING_STATUSES:
+            reason = (f"MARKET NOT TRADING | status={snap.get('status', '?')} "
+                      f"— skipping entries (maintenance/closed)")
+        elif not snap.get("healthy"):
+            # Trading status but no usable quotes on one/both sides: empty or
+            # one-sided book (illiquid window start, or maintenance empty book).
+            # Entries skipped; zero prices are never traded (ask>0 hard gate).
+            reason = (f"BOOK EMPTY | status={snap.get('status', '?')} "
+                      f"asks={snap.get('up_ask', 0):.2f}/{snap.get('down_ask', 0):.2f} "
+                      f"— skipping entries until quotes return")
+        elif self.feeds[asset].is_stale():
+            reason = f"FEED STALE | no successful spot fetch in {FEED_STALE_SECONDS}s — skipping entries"
+        if reason:
+            self._throttled_log(f"{asset}|HEALTH", f"{asset} {reason}")
+            st.market_healthy = False
+            return True
+        if not st.market_healthy:
+            self.log(f"{asset} MARKET HEALTHY — resuming entries")
+        st.market_healthy = True
+        return False
 
     def _orderbook_best(self, ticker: str) -> Tuple[float, float, float, float]:
         ob = self.api.get_orderbook(ticker, depth=3)
@@ -1561,6 +1855,13 @@ class KalshiTradingBot:
             if exit_price <= 0:
                 yes_bid, _, no_bid, _ = self._orderbook_best(pos.ticker)
                 bid = yes_bid if pos.side == "UP" else no_bid
+                if MARKET_HEALTH_ENABLED and bid <= 0:
+                    # v0.7.0 (F1): empty/maintenance book — never synthesize a
+                    # floor-price exit from nothing. Skip this cycle; the
+                    # position is held (settlement resolution is unaffected).
+                    self._throttled_log(f"{asset}|NOBID",
+                                        f"{asset} CLOSE SKIPPED — orderbook empty (maintenance?), holding position")
+                    return False, 0.0
                 exit_price = max(bid - FILL_BUFFER, floor) if bid > 0 else floor
             return True, exit_price
         self._pos_cache.pop(pos.ticker, None)
@@ -1711,6 +2012,11 @@ class KalshiTradingBot:
             st.phase = "HAS_POSITION"
             return
 
+        # Market-health gate (v0.7.0, F1): single veto point covering ALL
+        # strategies — maintenance blackout, closed/empty market, stale feed.
+        if MARKET_HEALTH_ENABLED and self._market_unhealthy(asset, snap):
+            return
+
         spread = (snap["up_ask"] - snap["up_bid"]) if snap["up_ask"] > 0 and snap["up_bid"] > 0 else 0.0
         decision: Optional[EntryDecision] = None
         use_dc = STRATEGY in ("delta_capture", "delta_capture_scalp")
@@ -1794,6 +2100,11 @@ class KalshiTradingBot:
             return
 
         entry_ask = (snap["up_ask"] or snap["up"]) if decision.side == "UP" else (snap["down_ask"] or snap["down"])
+        # Defense-in-depth (v0.7.0, F1): never book an entry at a zero ask.
+        if MARKET_HEALTH_ENABLED and entry_ask <= 0:
+            self._throttled_log(f"{asset}|ASK0",
+                                f"{asset} ENTRY ABORTED — resolved ask <= 0 (empty book?)")
+            return
         # Size decays per shot: entry N gets decision.size_mult x decay**(N-1)
         size_mult = decision.size_mult * (asset_param(asset, "REENTRY_SIZE_DECAY") ** st.entries_this_window)
         size = self.position_size(entry_ask, size_mult)
@@ -1847,7 +2158,7 @@ class KalshiTradingBot:
         st.phase = "IN_POSITION"
         st.entries_this_window += 1
         st.last_order_time = time.time()
-        self.log(f"{asset} IN POSITION | {decision.side} @ {tracked:.2f} | {snap['ticker']} | strike ~{strike or 0:.0f}")
+        self.log(f"{asset} IN POSITION | {decision.side} @ {tracked:.2f} | {snap['ticker']} | strike ~{strike or 0:.4g}")
 
     def _resolve_settlement(self, pos: Position, price: float) -> Optional[float]:
         """Resolve a held position's settlement value (1.0 win / 0.0 loss).
@@ -1922,6 +2233,15 @@ class KalshiTradingBot:
             st.phase = "WAIT_WINDOW"
             return True
 
+        # Zero-price guard (v0.7.0, F1): an empty/maintenance book resolves to
+        # current=0 — do NOT run stop-loss / time-stop / session-loss / profit-
+        # target / salvage evaluation against it. Hold; settlement resolution
+        # above is unaffected.
+        if MARKET_HEALTH_ENABLED and current <= 0:
+            self._throttled_log(f"{asset}|NOPX",
+                                f"{asset} PRICE UNAVAILABLE — holding position, skipping exit eval")
+            return True
+
         if use_dc:
             # Delta Capture: hold to settlement; optional salvage exit on delta flip
             salvage_on = asset_param(asset, "DC_SALVAGE_EXIT")
@@ -1975,7 +2295,7 @@ class KalshiTradingBot:
         width = 68
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         lines = ["+" + "-" * width + "+",
-                 f"|  kalshi-trading-bot v0.6.0  |  {now:<33}|",
+                 f"|  kalshi-trading-bot v{VERSION}  |  {now:<33}|",
                  "+" + "-" * width + "+"]
         mode = "LIVE" if self.live_orders else "PAPER"
         wr = self.daily_wins / max(1, self.daily_trades) * 100
@@ -1989,7 +2309,7 @@ class KalshiTradingBot:
             pos = self.positions.get(asset)
             pos_line = (f"{pos.side}@{pos.entry_price:.2f} x{pos.size}" if pos else "flat")
             lines.append(f"|  {asset:<4} {st.phase:<14} {d.get('ticker','-')[:24]:<24} {pos_line:<18}|"[:width+1] + "|")
-            lines.append(f"|    UP:{d.get('up',0):.2f} DN:{d.get('down',0):.2f} px:{d.get('price',0):.0f} "
+            lines.append(f"|    UP:{d.get('up',0):.2f} DN:{d.get('down',0):.2f} px:{d.get('price',0):.4g} "
                          f"K:{d.get('k',0):.0f} D:{d.get('d',0):.0f} d:{d.get('delta',0):+.4%} left:{d.get('mins',0):.1f}m"[:width+1] + "|")
             lines.append(f"|    MTF:{d.get('mtf',0):+.2f} bias:{d.get('mtf_bias','-'):<8}"[:width+1] + "|")
             lines.append("+" + "-" * width + "+")
@@ -2010,9 +2330,11 @@ class KalshiTradingBot:
     # ------------------------------ run loop ------------------------------
     def run(self):
         self.log("=" * 60)
-        self.log(f"kalshi-trading-bot v0.6.0 | Strategy: {STRATEGY}")
+        self.log(f"kalshi-trading-bot v{VERSION} | Strategy: {STRATEGY}")
         self.log(f"Mode: {'LIVE ORDERS' if self.live_orders else 'PAPER/TEST'} | Assets: {ASSETS}")
         self.log(f"Config file: {CONFIG_FILE_USED or 'none'}")
+        self.log(f"Market health: {'on' if MARKET_HEALTH_ENABLED else 'off'} | feed stale {FEED_STALE_SECONDS}s "
+                 f"| blackout windows: {len(MAINTENANCE_WINDOWS) if MAINTENANCE_WINDOWS else 'none'}")
         self.log(f"Multi-entry: max {MAX_ENTRIES_PER_WINDOW}/window | cooldown {REENTRY_COOLDOWN_SECONDS}s "
                  f"| size decay {REENTRY_SIZE_DECAY} | same-side {REENTRY_SAME_SIDE_ALLOWED} "
                  f"| after-loss-only {REENTRY_AFTER_LOSS_ONLY}")
@@ -2063,7 +2385,7 @@ class KalshiTradingBot:
                             st.last_proposed_side = ""
                             if st.phase not in ("IN_POSITION", "EMERGENCY_EXIT"):
                                 st.phase = "WAIT_WINDOW"
-                            self.log(f"{asset} New window: {snap['ticker']} | strike ~{strike or 0:.0f}")
+                            self.log(f"{asset} New window: {snap['ticker']} | strike ~{strike or 0:.4g}")
                         # Position management
                         if asset in self.positions:
                             any_active = True
@@ -2157,7 +2479,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Full CLI. Every flag maps to a module-global config variable; flags take
     precedence over the script defaults (which stay the documented baseline)."""
     p = argparse.ArgumentParser(
-        description="kalshi-trading-bot v0.6.0 — Kalshi 15-min crypto up/down bot",
+        description=f"kalshi-trading-bot v{VERSION} — Kalshi 15-min crypto up/down bot",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--config-file", metavar="PATH",
                    help="JSON config file path (default: kalshi_bot_config.json next to "
@@ -2223,6 +2545,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--asset-overrides",
                    help="Per-asset overrides as JSON, e.g. "
                         '\'{"ETH":{"MTF_MIN_TRADE_SCORE":0.15}}\' (ASSET_OVERRIDES)')
+    p.add_argument("--market-health", dest="market_health", action="store_true", default=None,
+                   help="Enable market-health guards (MARKET_HEALTH_ENABLED=True)")
+    p.add_argument("--no-market-health", dest="market_health", action="store_false", default=None,
+                   help="Disable market-health guards (MARKET_HEALTH_ENABLED=False)")
+    p.add_argument("--feed-stale-seconds", type=int,
+                   help="Spot-feed staleness threshold in seconds (FEED_STALE_SECONDS)")
+    p.add_argument("--maintenance-windows",
+                   help="UTC entry blackouts as JSON, e.g. "
+                        '\'[["3","05:00","08:00"]]\' (MAINTENANCE_WINDOWS)')
     return p
 
 
@@ -2265,7 +2596,8 @@ def apply_cli_overrides(args: argparse.Namespace) -> List[str]:
             ("dc_salvage_min_hold", "DC_SALVAGE_MIN_HOLD_S"),
             ("max_entries_per_window", "MAX_ENTRIES_PER_WINDOW"),
             ("reentry_cooldown", "REENTRY_COOLDOWN_SECONDS"),
-            ("reentry_size_decay", "REENTRY_SIZE_DECAY")]:
+            ("reentry_size_decay", "REENTRY_SIZE_DECAY"),
+            ("feed_stale_seconds", "FEED_STALE_SECONDS")]:
         val = getattr(args, arg_name)
         if val is not None:
             setg(glob_name, val)
@@ -2279,6 +2611,18 @@ def apply_cli_overrides(args: argparse.Namespace) -> List[str]:
         setg("REENTRY_SAME_SIDE_ALLOWED", args.reentry_same_side)
     if args.reentry_after_loss_only is not None:
         setg("REENTRY_AFTER_LOSS_ONLY", args.reentry_after_loss_only)
+    if args.market_health is not None:
+        setg("MARKET_HEALTH_ENABLED", args.market_health)
+    if args.maintenance_windows is not None:
+        try:
+            mw = json.loads(args.maintenance_windows)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"--maintenance-windows: invalid JSON: {e}")
+        ok, mw = _coerce_maintenance_windows(mw)
+        if not ok:
+            raise SystemExit("--maintenance-windows: must be a JSON list of "
+                             '[weekday, "HH:MM", "HH:MM"] (weekday 0=Mon..6=Sun, UTC)')
+        setg("MAINTENANCE_WINDOWS", mw)
     if args.force_paper:
         setg("FORCE_PAPER_MODE", True)
     if args.asset_overrides is not None:
@@ -2318,6 +2662,7 @@ MENU_SECTIONS = [
                        "PAUSE_AFTER_LOSS_STREAK_MIN", "POST_TRADE_COOLDOWN_SECONDS"]),
     ("Exits & Salvage", ["DC_SALVAGE_EXIT", "DC_SALVAGE_MIN_MINUTES", "DC_SALVAGE_MIN_FLIP_PCT",
                          "DC_SALVAGE_MIN_HOLD_S", "PROFIT_TARGET", "NO_ENTRY_FINAL_SECONDS"]),
+    ("Market health", ["MARKET_HEALTH_ENABLED", "FEED_STALE_SECONDS", "MAINTENANCE_WINDOWS"]),
     ("Per-Asset Overrides", None),  # special JSON editor for ASSET_OVERRIDES
 ]
 
@@ -2333,6 +2678,14 @@ def _menu_parse_value(name: str, text: str, default):
     """Parse user input according to the script default's type.
     Returns (ok, value_or_error_message). Never raises."""
     text = text.strip()
+    if name == "MAINTENANCE_WINDOWS":
+        try:
+            v = json.loads(text)
+        except json.JSONDecodeError as e:
+            return False, f"invalid JSON: {e}"
+        ok, cv = _coerce_maintenance_windows(v)
+        return (True, cv) if ok else (False, 'enter JSON like [["3","05:00","08:00"]] '
+                                          '(weekday 0=Mon..6=Sun, UTC; [] = none)')
     if isinstance(default, bool):
         t = text.lower()
         if t in ("y", "yes", "true", "1"):
@@ -2415,7 +2768,10 @@ def run_config_menu(cli_path: Optional[str]) -> Optional[str]:
                         continue
                     kk = "MAX_ENTRIES_PER_WINDOW" if k == "MAX_TRADES_PER_SESSION" else k
                     if kk in values:
-                        ok, cv = _coerce_config_value(v, values[kk])
+                        if kk == "MAINTENANCE_WINDOWS":
+                            ok, cv = _coerce_maintenance_windows(v)
+                        else:
+                            ok, cv = _coerce_config_value(v, values[kk])
                         if ok:
                             values[kk] = cv
         except Exception as e:
@@ -2513,15 +2869,16 @@ def run_config_menu(cli_path: Optional[str]) -> Optional[str]:
         return path
 
     try:
+        save_choice = str(len(MENU_SECTIONS) + 1)
         while True:
-            print("\n=== kalshi-trading-bot v0.6.0 — config editor ===")
+            print(f"\n=== kalshi-trading-bot v{VERSION} — config editor ===")
             print(f"Target config file: {path}")
             for i, (title, _) in enumerate(MENU_SECTIONS, 1):
                 print(f"  {i}) {title}")
-            print("  9) Save & exit")
+            print(f"  {save_choice}) Save & exit")
             print("  0) Exit without saving")
             choice = input("Select section: ").strip().lower()
-            if choice == "9":
+            if choice == save_choice:
                 return save()
             if choice == "0":
                 print("Exiting without saving.")
