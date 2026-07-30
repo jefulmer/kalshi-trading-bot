@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-kalshi-trading-bot (v0.5.0)
+kalshi-trading-bot (v0.6.0)
 ===========================
 Automated trading bot for Kalshi 15-minute crypto up/down markets
 (default: BTC, series KXBTC15M).
@@ -27,6 +27,63 @@ MODES:
   - Set FORCE_PAPER_MODE = True to override and always paper-trade.
 
 CHANGELOG:
+  v0.6.0 (2026-07-30):
+    - NEW: JSON config file support with a strict precedence chain:
+      script defaults < config file < CLI flags. Default path
+      kalshi_bot_config.json (searched next to the script first, then the
+      CWD); --config-file PATH overrides the search. Flat JSON object keyed
+      by module-global config names; unknown keys warn and are ignored,
+      type errors warn and skip that key (never crash). Applied values are
+      logged as "Config file (<path>): KEY=value | ..." at startup.
+    - NEW: interactive config menu (--menu / --config). Pure-stdlib
+      terminal menu that edits the config file and exits (no trading).
+      Grouped sections, per-param defaults shown, reset-to-default, and a
+      save that writes only values differing from script defaults.
+    - NEW: multiple shots on goal (multi-entry per 15-min window).
+      MAX_ENTRIES_PER_WINDOW replaces the hard single-shot block
+      (MAX_TRADES_PER_SESSION deprecated; config-file values are copied
+      over with a warning). Re-entries honor REENTRY_COOLDOWN_SECONDS,
+      size-decay by REENTRY_SIZE_DECAY ** (N-1), optional same-side block
+      after a losing exit (REENTRY_SAME_SIDE_ALLOWED), and an
+      after-loss-only mode (REENTRY_AFTER_LOSS_ONLY). All five resolvable
+      per-asset via ASSET_OVERRIDES, settable via config file, menu
+      section 5, and CLI flags. New CLI: --max-entries-per-window,
+      --reentry-cooldown, --reentry-size-decay, --reentry-same-side /
+      --no-reentry-same-side, --reentry-after-loss-only /
+      --no-reentry-after-loss-only, plus salvage flags
+      --dc-salvage-min-flip / --dc-salvage-min-hold.
+    - NEW: NEAR (KXNEAR15M) and ZEC (KXZEC15M) markets with Kraken/Binance
+      symbol maps.
+    - TUNE (backtest, 30d x 8 assets, 2026-06-30 -> 2026-07-30, Binance 1m):
+      full config sweep (salvage on/off/tuned x shots 1/3 x conviction gate
+      x min-delta x price cap x profit target). Findings -> new
+      ASSET_OVERRIDES calibration:
+        * Per-asset DC_MIN_DELTA_PCT is the strongest lever: a fixed global
+          min-delta misfits every asset (BNB/BTC trade profitably at 0.02%
+          deltas; high-vol assets need a bigger cushion). Overrides: SOL
+          0.0004, ETH/XRP/NEAR 0.0006, DOGE 0.0008; BTC/BNB/ZEC keep the
+          0.0002 global. 30d result vs v0.5.0: WR 56.5% -> 63.8%, modeled
+          net -$24.21 -> -$2.62 (gross positive +$0.82; modeled prices are
+          fair-value+premium, so gross-positive is a strong signal).
+        * NEAR/ZEC get DC_MAX_ENTRY_PRICE 0.58 (modeled pricier entries on
+          the two high-vol newcomers lose; keep them conservative until
+          paper fills prove otherwise). Global stays 0.62 — the 2026-07-29
+          live run banked 4 of 7 wins at 0.59-0.62 asks.
+        * ATR caps recalibrated to 30d p75: global 0.0006 (BTC), ETH 0.0009,
+          SOL 0.0010, XRP 0.0009, DOGE 0.0009, BNB 0.0006, NEAR 0.0015,
+          ZEC 0.0018.
+        * Salvage ON at current defaults beats OFF and tuned variants in
+          every modeled cell (the v0.5.0 live "all losses were salvage
+          exits" is survivorship — those trades lost more at settlement).
+        * Multi-entry replay: re-entries essentially never fire under the
+          current entry discipline — after a win the contract is too
+          expensive for the caps, after a loss the flip side fails
+          min-delta/price gates. The feature ships default single-shot
+          (MAX_ENTRIES_PER_WINDOW=1); raising it is safe (gates still
+          protect) and becomes active as soon as a window genuinely
+          re-qualifies.
+        * ZEC is the weakest modeled asset (61% WR but negative at every
+          setting tested) — paper-only until live fills say otherwise.
   v0.5.0 (2026-07-29):
     - FIX (logging): stale MTF BLOCK lines. StrategyEngine.last_mtf_block was
       reset AFTER the MTF conviction-gate return in delta_capture(), so a veto
@@ -36,7 +93,7 @@ CHANGELOG:
       lines (2026-07-28 paper run). last_mtf_block is now reset before ALL
       gate returns, and conviction-gate vetoes log on their own path:
       "MTF GATE | score ... below conviction threshold".
-    - TUNE (backtest, 24h x 6 assets, backtest_kalshi.py): the v0.4.0 paper
+    - TUNE (backtest, 24h x 6 assets): the v0.4.0 paper
       session traded ZERO times in 18h; the replay confirms the config is
       over-constrained and that the binding constraint DIVERGES BY ASSET:
         * MTF_MIN_TRADE_SCORE 0.20 -> 0.10. At 0.20 the conviction gate alone
@@ -166,7 +223,7 @@ CHANGELOG:
       retry with backoff on 429/5xx.
 """
 
-import os, sys, json, time, base64, argparse, logging, csv, random, math
+import os, sys, json, time, base64, argparse, logging, csv, random, math, copy
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
@@ -192,7 +249,7 @@ STRATEGY = "delta_capture"        # "delta_capture" (default, recommended),
                                   # "momentum_breakout", "divergence_play"
 
 # --- Assets & markets ---
-ASSETS = ["BTC"]                  # Any of: BTC ETH SOL XRP DOGE HYPE BNB
+ASSETS = ["BTC"]                  # Any of: BTC ETH SOL XRP DOGE HYPE BNB NEAR ZEC
 KALSHI_API_BASE = "https://external-api.kalshi.com"   # Production API
 # KALSHI_API_BASE = "https://demo-api.kalshi.co"      # Uncomment for Kalshi demo
 
@@ -295,8 +352,18 @@ MAX_DRAWDOWN_PERCENT = 15.0       # Halt if daily loss exceeds this % of balance
 MAX_CONSECUTIVE_LOSSES = 3        # After N straight losses...
 PAUSE_AFTER_LOSS_STREAK_MIN = 60  # ...pause this many minutes
 MAX_LOSS_PER_SESSION = 2.0        # Per-window session loss cap ($)
-MAX_TRADES_PER_SESSION = 1        # Trades allowed per 15-min window
+MAX_TRADES_PER_SESSION = 1        # DEPRECATED (v0.6.0): superseded by MAX_ENTRIES_PER_WINDOW.
+                                  # Setting it via the config file copies the value into
+                                  # MAX_ENTRIES_PER_WINDOW with a deprecation warning.
 POST_TRADE_COOLDOWN_SECONDS = 90
+
+# --- Multi-Entry / "Shots on Goal" (v0.6.0) ---
+# Defaults preserve the v0.5.0 single-shot behavior: one entry per window.
+MAX_ENTRIES_PER_WINDOW = 1        # Total entries allowed per 15-min window per asset
+REENTRY_COOLDOWN_SECONDS = 120    # Min wait after an exit before re-entering the same window
+REENTRY_SIZE_DECAY = 0.5          # Re-entry N gets size x (decay ** (N-1)) on top of decision.size_mult
+REENTRY_SAME_SIDE_ALLOWED = False # After a losing exit, block re-entry on the SAME side that just failed
+REENTRY_AFTER_LOSS_ONLY = False   # True = extra entries (2nd+) only allowed if the previous window trade lost
 
 # --- Exit management (binary: default is hold to settlement) ---
 PROFIT_TARGET = 0.92              # Take profit if contract reaches this
@@ -338,29 +405,39 @@ PRETTY_DISPLAY = False            # True = live terminal dashboard
 
 ASSET_SERIES_MAP = {
     "BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M",
-    "XRP": "KXXRP15M", "DOGE": "KXDOGE15M", "HYPE": "KXHYPE15M", "BNB": "KXBNB15M"
+    "XRP": "KXXRP15M", "DOGE": "KXDOGE15M", "HYPE": "KXHYPE15M", "BNB": "KXBNB15M",
+    "NEAR": "KXNEAR15M", "ZEC": "KXZEC15M",
 }
 ASSET_SYMBOL_MAP = {   # Exchange spot symbols (Kraken pair, Binance symbol)
     "BTC": ("XBTUSD", "BTCUSDT"), "ETH": ("ETHUSD", "ETHUSDT"),
     "SOL": ("SOLUSD", "SOLUSDT"), "XRP": ("XRPUSD", "XRPUSDT"),
     "DOGE": ("DOGEUSD", "DOGEUSDT"), "HYPE": ("HYPEUSD", "HYPEUSDT"),
     "BNB": ("BNBUSD", "BNBUSDT"),
+    "NEAR": ("NEARUSD", "NEARUSDT"), "ZEC": ("ZECUSD", "ZECUSDT"),
 }
 
 # --- Per-asset parameter overrides (v0.5.0) ---
 # Any entry-tunable global can be overridden per asset here; the engine
 # resolves each value as override-with-global-fallback via asset_param().
-# Basis: 24h x 6-asset backtest (backtest_kalshi.py / BACKTEST_REPORT.md).
+# Basis: 24h x 6-asset backtest.
 # The 1m ATR% level diverges ~2x across assets, so a single global ATR cap
 # either strangles high-vol assets or protects low-vol ones too little.
 # Caps below ~= p75 of each asset's 24h ATR% distribution (block the burstiest
 # quartile only). HYPE has no Binance spot feed — untested, no override.
 ASSET_OVERRIDES = {
-    "ETH":  {"DC_ATR_MAX_PCT": 0.0010},
-    "SOL":  {"DC_ATR_MAX_PCT": 0.0010},
-    "XRP":  {"DC_ATR_MAX_PCT": 0.0010},
-    "DOGE": {"DC_ATR_MAX_PCT": 0.0010},
-    "BNB":  {"DC_ATR_MAX_PCT": 0.0005},
+    # ATR caps = p75 of each asset's 30d 1m ATR% distribution (2026-06-30..07-30).
+    # Min-delta overrides = best cell in the 30d per-asset sweep (0.0002/0.0004/
+    # 0.0006/0.0008): low-vol BTC/BNB/ZEC keep the 0.0002 global (their profitable
+    # trades live at small deltas); DOGE (weakest) gets the biggest cushion.
+    # NEAR/ZEC price cap 0.58: modeled pricier entries on the high-vol newcomers
+    # lose; keep them conservative until paper fills prove otherwise.
+    "ETH":  {"DC_ATR_MAX_PCT": 0.0009, "DC_MIN_DELTA_PCT": 0.0006},
+    "SOL":  {"DC_ATR_MAX_PCT": 0.0010, "DC_MIN_DELTA_PCT": 0.0004},
+    "XRP":  {"DC_ATR_MAX_PCT": 0.0009, "DC_MIN_DELTA_PCT": 0.0006},
+    "DOGE": {"DC_ATR_MAX_PCT": 0.0009, "DC_MIN_DELTA_PCT": 0.0008},
+    "BNB":  {"DC_ATR_MAX_PCT": 0.0006},
+    "NEAR": {"DC_ATR_MAX_PCT": 0.0015, "DC_MIN_DELTA_PCT": 0.0006, "DC_MAX_ENTRY_PRICE": 0.58},
+    "ZEC":  {"DC_ATR_MAX_PCT": 0.0018, "DC_MAX_ENTRY_PRICE": 0.58},
 }
 
 
@@ -371,6 +448,190 @@ def asset_param(asset: str, name: str):
     if ov and name in ov:
         return ov[name]
     return globals()[name]
+
+
+# ============================================================================
+# CONFIG FILE (v0.6.0) — precedence: script defaults < config file < CLI flags
+# ============================================================================
+CONFIG_FILE_DEFAULT = "kalshi_bot_config.json"
+CONFIG_FILE_USED: Optional[str] = None   # set in main(); shown in the run() header
+
+# Explicit allowlist of module globals settable via the config file / menu.
+CONFIG_SETTABLE = {
+    # Strategy & assets
+    "STRATEGY", "ASSETS", "KALSHI_API_BASE", "API_KEYS_DIR", "FORCE_PAPER_MODE",
+    # Delta Capture core
+    "DC_ENTRY_WINDOW_MIN", "DC_MIN_DELTA_PCT", "DC_MAX_DELTA_PCT",
+    "DC_MAX_ENTRY_PRICE", "DC_STOCH_K_LONG_MIN", "DC_REQUIRE_K_GT_D",
+    "DC_DEAD_ZONE", "DC_ATR_MAX_PCT", "DC_MAX_SPREAD_CENTS",
+    # Scalp
+    "DC_SCALP_ENABLED", "DC_SCALP_WINDOW_MIN", "DC_SCALP_MIN_MOVE_PCT",
+    "DC_SCALP_MAX_PRICE", "DC_SCALP_K_UP", "DC_SCALP_K_DOWN", "DC_SCALP_SIZE_MULT",
+    # Salvage
+    "DC_SALVAGE_EXIT", "DC_SALVAGE_MIN_MINUTES", "DC_SALVAGE_MIN_FLIP_PCT",
+    "DC_SALVAGE_MIN_HOLD_S",
+    # MTF momentum
+    "MTF_ENABLED", "MTF_TIMEFRAMES", "MTF_RSI_LEN", "MTF_RET_BARS",
+    "MTF_CACHE_TTL_S", "MTF_COUNTER_TREND_BLOCK", "MTF_MIN_SCORE",
+    "MTF_STRONG_SCORE", "MTF_MIN_TRADE_SCORE", "MTF_TREND_MAX_DELTA_PCT",
+    "MTF_TREND_MAX_PRICE", "MTF_TREND_SIZE_MULT",
+    # Indicators
+    "RSI_LEN", "STOCH_LEN", "STOCH_K_SMOOTH", "STOCH_D_SMOOTH", "ATR_LEN",
+    "PRICE_HISTORY_MINUTES",
+    # Legacy rsi_extreme
+    "ENTRY_THRESHOLD", "EXIT_THRESHOLD", "RSI_MIN_FOR_UP", "RSI_MAX_FOR_DOWN",
+    "STOCH_OVERBOUGHT", "STOCH_OVERSOLD", "REQUIRE_1H_ALIGNMENT",
+    "MIN_TIMEFRAME_AGREEMENT", "ENTRY_CONFIRMATION_CYCLES", "MAX_PRICE_VELOCITY",
+    # Legacy indicator strategies
+    "RSI_PERIOD", "RSI_OVERSOLD", "RSI_OVERBOUGHT", "RSI_DIVERGENCE_THRESHOLD",
+    # Sizing
+    "ORDER_SIZE", "MAX_ORDER_SIZE", "MAX_RISK_PER_TRADE_PCT",
+    "MAX_CONCURRENT_POSITIONS",
+    # Risk gates
+    "BANKROLL", "MAX_DAILY_LOSS", "MAX_DRAWDOWN_PERCENT",
+    "MAX_CONSECUTIVE_LOSSES", "PAUSE_AFTER_LOSS_STREAK_MIN",
+    "MAX_LOSS_PER_SESSION", "MAX_TRADES_PER_SESSION", "POST_TRADE_COOLDOWN_SECONDS",
+    # Multi-Entry / Shots on Goal (v0.6.0)
+    "MAX_ENTRIES_PER_WINDOW", "REENTRY_COOLDOWN_SECONDS", "REENTRY_SIZE_DECAY",
+    "REENTRY_SAME_SIDE_ALLOWED", "REENTRY_AFTER_LOSS_ONLY",
+    # Exit management
+    "PROFIT_TARGET", "MAX_LOSS_PER_TRADE", "EARLY_TIME_STOP_SECONDS",
+    "TIME_EXIT_MINUTES", "EMERGENCY_EXIT_PRICE", "STOP_LOSS_FLOOR_PRICE",
+    "TRAILING_STOP_PCT", "MIN_PROFIT_FOR_TRAILING", "MIN_HOLD_SECONDS",
+    "BREAKEVEN_TRIGGER_PROFIT", "BREAKEVEN_BUFFER", "MAX_HOLD_TIME_SECONDS",
+    "NO_ENTRY_FINAL_SECONDS",
+    # Order execution
+    "BUY_PRICE_DIFF", "AGGRESSIVE_ENTRY", "FILL_BUFFER", "DYNAMIC_FILL_BUFFER",
+    "ENTRY_TIME_IN_FORCE", "ORDER_TIMEOUT_SECONDS", "EMERGENCY_MAX_RETRIES",
+    "KALSHI_TAKER_FEE_COEFF",
+    # Polling / display
+    "POLL_INTERVAL_MONITORING_S", "POLL_INTERVAL_RELAXED_S", "PRICE_POLL_SECONDS",
+    "MARKET_REFRESH_MS", "KLINES_CACHE_TTL_S", "BALANCE_CACHE_TTL_S",
+    "PRETTY_DISPLAY",
+    # Per-asset overrides
+    "ASSET_OVERRIDES",
+}
+
+# Immutable snapshot of the script defaults (import-time), used by the config
+# loader for type coercion and by the menu for diffing/reset.
+_SCRIPT_DEFAULTS = {name: copy.deepcopy(globals()[name]) for name in CONFIG_SETTABLE}
+
+_STRATEGY_CHOICES = ["delta_capture", "delta_capture_scalp", "rsi_extreme",
+                     "multi_tf_confluence", "mean_reversion",
+                     "momentum_breakout", "divergence_play"]
+
+
+def _coerce_config_value(value, default):
+    """Coerce a JSON value to the type of the script default.
+    Returns (ok, coerced). Never raises."""
+    try:
+        if isinstance(default, bool):
+            return (True, value) if isinstance(value, bool) else (False, None)
+        if isinstance(default, int):
+            if isinstance(value, bool):
+                return False, None
+            return (True, value) if isinstance(value, int) else (False, None)
+        if isinstance(default, float):
+            if isinstance(value, bool):
+                return False, None
+            return (True, float(value)) if isinstance(value, (int, float)) else (False, None)
+        if isinstance(default, str):
+            return (True, value) if isinstance(value, str) else (False, None)
+        if isinstance(default, tuple):
+            if isinstance(value, (list, tuple)) and len(value) == len(default):
+                return True, tuple(type(d)(v) for d, v in zip(default, value))
+            return False, None
+        if isinstance(default, list):
+            if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                return True, [v.strip().upper() for v in value if v.strip()]
+            return False, None
+        if isinstance(default, dict):
+            return (True, value) if isinstance(value, dict) else (False, None)
+    except (TypeError, ValueError):
+        return False, None
+    return False, None
+
+
+def find_config_file(cli_path: Optional[str]) -> Optional[str]:
+    """Locate the config file: explicit --config-file wins; otherwise look next
+    to the script first, then the CWD. Returns None if nothing exists."""
+    if cli_path:
+        return cli_path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [os.path.join(script_dir, CONFIG_FILE_DEFAULT),
+                  os.path.join(os.getcwd(), CONFIG_FILE_DEFAULT)]
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def load_config_file(path: Optional[str]):
+    """Apply a JSON config file to module globals (called BEFORE CLI overrides).
+    Returns (path_or_None, applied_labels, messages) where messages is a list
+    of (level, msg) to log once logging is set up. Never raises on bad config."""
+    messages: List[Tuple[int, str]] = []
+    if not path:
+        return None, [], [(logging.INFO, "No config file found (using script defaults)")]
+    if not os.path.exists(path):
+        return None, [], [(logging.WARNING, f"Config file {path} not found (using script defaults)")]
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        return path, [], [(logging.WARNING, f"Config file {path} unreadable ({e}) — using script defaults")]
+    if not isinstance(data, dict):
+        return path, [], [(logging.WARNING, f"Config file {path}: top-level must be a JSON object — ignored")]
+
+    # Deprecation shim: legacy MAX_TRADES_PER_SESSION copies into the
+    # authoritative MAX_ENTRIES_PER_WINDOW (v0.6.0) unless the new key is set.
+    if "MAX_TRADES_PER_SESSION" in data:
+        messages.append((logging.WARNING,
+                         "Config file: MAX_TRADES_PER_SESSION is deprecated (v0.6.0) — "
+                         "use MAX_ENTRIES_PER_WINDOW; copying value"))
+        if "MAX_ENTRIES_PER_WINDOW" not in data:
+            data["MAX_ENTRIES_PER_WINDOW"] = data["MAX_TRADES_PER_SESSION"]
+
+    applied = []
+    for key, value in data.items():
+        if key.startswith("_"):
+            continue  # "_comment" header etc.
+        if key == "MAX_TRADES_PER_SESSION":
+            continue  # handled by the deprecation shim above
+        if key not in CONFIG_SETTABLE:
+            messages.append((logging.WARNING, f"Config file ({path}): unknown key {key!r} ignored"))
+            continue
+        ok, coerced = _coerce_config_value(value, _SCRIPT_DEFAULTS[key])
+        if not ok:
+            messages.append((logging.WARNING,
+                             f"Config file ({path}): {key} has wrong type ({value!r}) — skipped"))
+            continue
+        if key == "STRATEGY" and coerced not in _STRATEGY_CHOICES:
+            messages.append((logging.WARNING,
+                             f"Config file ({path}): unknown STRATEGY {coerced!r} — skipped"))
+            continue
+        if key == "ASSETS":
+            unknown = [a for a in coerced if a not in ASSET_SERIES_MAP]
+            if unknown:
+                messages.append((logging.WARNING,
+                                 f"Config file ({path}): unknown asset(s) {unknown} — dropped"))
+                coerced = [a for a in coerced if a in ASSET_SERIES_MAP]
+            if not coerced:
+                messages.append((logging.WARNING, f"Config file ({path}): ASSETS empty — skipped"))
+                continue
+        if key == "ASSET_OVERRIDES":
+            if not all(isinstance(v, dict) for v in coerced.values()):
+                messages.append((logging.WARNING,
+                                 f"Config file ({path}): ASSET_OVERRIDES must map asset -> object — skipped"))
+                continue
+            unknown = [a for a in coerced if a not in ASSET_SERIES_MAP]
+            if unknown:
+                messages.append((logging.WARNING,
+                                 f"Config file ({path}): ASSET_OVERRIDES unknown asset(s) {unknown} — dropped"))
+                coerced = {a: v for a, v in coerced.items() if a in ASSET_SERIES_MAP}
+        globals()[key] = coerced
+        applied.append(f"{key}={coerced}")
+    return path, applied, messages
 
 
 # ============================================================================
@@ -1021,6 +1282,10 @@ class AssetState:
     total_pnl: float = 0.0
     session_trade_count: int = 0
     session_pnl: float = 0.0
+    entries_this_window: int = 0      # v0.6.0 multi-entry ("shots on goal")
+    last_exit_side: str = ""          # side of the last closed window trade
+    last_exit_reason: str = ""        # reason of the last closed window trade
+    last_exit_pnl: float = 0.0        # pnl of the last closed window trade
     last_trade_close_time: float = 0.0
     last_order_time: float = 0.0
     pending_order_id: str = ""
@@ -1344,6 +1609,12 @@ class KalshiTradingBot:
         st.session_trade_count += 1
         st.session_pnl += pnl
         st.last_trade_close_time = time.time()
+        # v0.6.0: remember the exit for re-entry gating (same-side block /
+        # after-loss-only). Cleared on the next window roll.
+        if pos:
+            st.last_exit_side = pos.side
+        st.last_exit_reason = reason
+        st.last_exit_pnl = pnl
         if pnl >= 0:
             st.win_count += 1
             self.daily_wins += 1
@@ -1415,9 +1686,19 @@ class KalshiTradingBot:
         if time.time() < st.loss_pause_until:
             self.log_once(f"{asset}|PAUSE", f"{asset} paused after loss streak")
             return
-        if st.session_trade_count >= MAX_TRADES_PER_SESSION:
+        # v0.6.0 multi-entry gate ("shots on goal"): up to MAX_ENTRIES_PER_WINDOW
+        # entries per 15-min window per asset (default 1 = v0.5.0 behavior).
+        max_entries = asset_param(asset, "MAX_ENTRIES_PER_WINDOW")
+        if st.entries_this_window >= max_entries:
             return
-        if time.time() - st.last_trade_close_time < POST_TRADE_COOLDOWN_SECONDS:
+        reentry = st.entries_this_window >= 1
+        # Re-entries must wait REENTRY_COOLDOWN_SECONDS after the last exit (and
+        # never less than the standard post-trade cooldown). First entry in a
+        # window keeps the plain POST_TRADE_COOLDOWN_SECONDS behavior, which also
+        # covers a trade in a prior window (last_trade_close_time persists).
+        cooldown = (max(asset_param(asset, "REENTRY_COOLDOWN_SECONDS"), POST_TRADE_COOLDOWN_SECONDS)
+                    if reentry else POST_TRADE_COOLDOWN_SECONDS)
+        if time.time() - st.last_trade_close_time < cooldown:
             return
         if time.time() - st.last_order_time < 60 and st.last_order_time > 0:
             return
@@ -1495,14 +1776,32 @@ class KalshiTradingBot:
 
         if not decision:
             return
+
+        # v0.6.0 re-entry gates (after a decision is produced, before sizing)
+        if reentry:
+            if (not asset_param(asset, "REENTRY_SAME_SIDE_ALLOWED")
+                    and st.last_exit_pnl < 0 and decision.side == st.last_exit_side):
+                self.log_once(f"{asset}|REBLK{snap['ticker']}",
+                              f"{asset} RE-ENTRY BLOCK | same side {decision.side} after "
+                              f"{st.last_exit_reason} loss")
+                return
+            if asset_param(asset, "REENTRY_AFTER_LOSS_ONLY") and st.last_exit_pnl >= 0:
+                return
+
         spread_max = asset_param(asset, "DC_MAX_SPREAD_CENTS")
         if spread > 0 and spread * 100 > spread_max:
             self.log_once(f"{asset}|SPREAD", f"{asset} spread {spread*100:.0f}c > {spread_max}c")
             return
 
         entry_ask = (snap["up_ask"] or snap["up"]) if decision.side == "UP" else (snap["down_ask"] or snap["down"])
-        size = self.position_size(entry_ask, decision.size_mult)
-        self.log(f"{asset} ENTRY {decision.side} x{size} @ ~{entry_ask:.2f} | {STRATEGY} | {decision.reason}")
+        # Size decays per shot: entry N gets decision.size_mult x decay**(N-1)
+        size_mult = decision.size_mult * (asset_param(asset, "REENTRY_SIZE_DECAY") ** st.entries_this_window)
+        size = self.position_size(entry_ask, size_mult)
+        if reentry:
+            self.log(f"{asset} RE-ENTRY {st.entries_this_window + 1}/{max_entries} {decision.side} x{size} "
+                     f"@ ~{entry_ask:.2f} | {STRATEGY} | {decision.reason}")
+        else:
+            self.log(f"{asset} ENTRY {decision.side} x{size} @ ~{entry_ask:.2f} | {STRATEGY} | {decision.reason}")
 
         order_id, order_price = self.place_buy(asset, snap["ticker"], decision.side, entry_ask, size)
         st.pending_order_id = order_id or ""
@@ -1546,6 +1845,7 @@ class KalshiTradingBot:
             stop_loss=max(EXIT_THRESHOLD, tracked - MAX_LOSS_PER_TRADE),
             highest_price=tracked)
         st.phase = "IN_POSITION"
+        st.entries_this_window += 1
         st.last_order_time = time.time()
         self.log(f"{asset} IN POSITION | {decision.side} @ {tracked:.2f} | {snap['ticker']} | strike ~{strike or 0:.0f}")
 
@@ -1675,7 +1975,7 @@ class KalshiTradingBot:
         width = 68
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         lines = ["+" + "-" * width + "+",
-                 f"|  kalshi-trading-bot v0.5.0  |  {now:<33}|",
+                 f"|  kalshi-trading-bot v0.6.0  |  {now:<33}|",
                  "+" + "-" * width + "+"]
         mode = "LIVE" if self.live_orders else "PAPER"
         wr = self.daily_wins / max(1, self.daily_trades) * 100
@@ -1710,8 +2010,12 @@ class KalshiTradingBot:
     # ------------------------------ run loop ------------------------------
     def run(self):
         self.log("=" * 60)
-        self.log(f"kalshi-trading-bot v0.5.0 | Strategy: {STRATEGY}")
+        self.log(f"kalshi-trading-bot v0.6.0 | Strategy: {STRATEGY}")
         self.log(f"Mode: {'LIVE ORDERS' if self.live_orders else 'PAPER/TEST'} | Assets: {ASSETS}")
+        self.log(f"Config file: {CONFIG_FILE_USED or 'none'}")
+        self.log(f"Multi-entry: max {MAX_ENTRIES_PER_WINDOW}/window | cooldown {REENTRY_COOLDOWN_SECONDS}s "
+                 f"| size decay {REENTRY_SIZE_DECAY} | same-side {REENTRY_SAME_SIDE_ALLOWED} "
+                 f"| after-loss-only {REENTRY_AFTER_LOSS_ONLY}")
         self.log(f"Delta Capture: window {DC_ENTRY_WINDOW_MIN}m | delta {DC_MIN_DELTA_PCT:.4%}-{DC_MAX_DELTA_PCT:.4%} "
                  f"| max entry ${DC_MAX_ENTRY_PRICE} | ATR cap {DC_ATR_MAX_PCT:.4%} | spread cap {DC_MAX_SPREAD_CENTS}c")
         self.log(f"Scalp: {'on' if DC_SCALP_ENABLED else 'off'} window {DC_SCALP_WINDOW_MIN}m | "
@@ -1750,6 +2054,10 @@ class KalshiTradingBot:
                             st.session_key = session_key
                             st.session_trade_count = 0
                             st.session_pnl = 0.0
+                            st.entries_this_window = 0     # v0.6.0 multi-entry reset
+                            st.last_exit_side = ""
+                            st.last_exit_reason = ""
+                            st.last_exit_pnl = 0.0
                             st.entry_attempts = 0
                             st.confirmation_count = 0
                             st.last_proposed_side = ""
@@ -1849,8 +2157,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Full CLI. Every flag maps to a module-global config variable; flags take
     precedence over the script defaults (which stay the documented baseline)."""
     p = argparse.ArgumentParser(
-        description="kalshi-trading-bot v0.5.0 — Kalshi 15-min crypto up/down bot",
+        description="kalshi-trading-bot v0.6.0 — Kalshi 15-min crypto up/down bot",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--config-file", metavar="PATH",
+                   help="JSON config file path (default: kalshi_bot_config.json next to "
+                        "the script, then CWD). Precedence: script defaults < config file < CLI flags")
+    p.add_argument("--menu", "--config", dest="menu", action="store_true",
+                   help="Open the interactive config-file editor menu and exit (no trading)")
     p.add_argument("--strategy", choices=["delta_capture", "delta_capture_scalp", "rsi_extreme",
                                           "multi_tf_confluence", "mean_reversion",
                                           "momentum_breakout", "divergence_play"],
@@ -1889,6 +2202,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Enable delta-flip salvage exits (DC_SALVAGE_EXIT=True)")
     p.add_argument("--no-salvage", dest="salvage", action="store_false", default=None,
                    help="Disable salvage exits (DC_SALVAGE_EXIT=False)")
+    p.add_argument("--dc-salvage-min-flip", type=float,
+                   help="Salvage: min flipped |delta| fraction (DC_SALVAGE_MIN_FLIP_PCT)")
+    p.add_argument("--dc-salvage-min-hold", type=float,
+                   help="Salvage: min hold seconds before salvage exit (DC_SALVAGE_MIN_HOLD_S)")
+    p.add_argument("--max-entries-per-window", type=int,
+                   help="Entries allowed per 15-min window per asset (MAX_ENTRIES_PER_WINDOW)")
+    p.add_argument("--reentry-cooldown", type=float,
+                   help="Min seconds after an exit before re-entering the window (REENTRY_COOLDOWN_SECONDS)")
+    p.add_argument("--reentry-size-decay", type=float,
+                   help="Re-entry N size multiplier decay**(N-1) (REENTRY_SIZE_DECAY)")
+    p.add_argument("--reentry-same-side", dest="reentry_same_side", action="store_true", default=None,
+                   help="Allow re-entry on the same side after a losing exit")
+    p.add_argument("--no-reentry-same-side", dest="reentry_same_side", action="store_false", default=None,
+                   help="Block re-entry on the same side after a losing exit")
+    p.add_argument("--reentry-after-loss-only", dest="reentry_after_loss_only", action="store_true",
+                   default=None, help="Allow extra entries only after a losing window trade")
+    p.add_argument("--no-reentry-after-loss-only", dest="reentry_after_loss_only", action="store_false",
+                   default=None, help="Allow extra entries after any window trade")
     p.add_argument("--asset-overrides",
                    help="Per-asset overrides as JSON, e.g. "
                         '\'{"ETH":{"MTF_MIN_TRADE_SCORE":0.15}}\' (ASSET_OVERRIDES)')
@@ -1929,7 +2260,12 @@ def apply_cli_overrides(args: argparse.Namespace) -> List[str]:
             ("mtf_strong_score", "MTF_STRONG_SCORE"), ("mtf_min_score", "MTF_MIN_SCORE"),
             ("order_size", "ORDER_SIZE"), ("max_order_size", "MAX_ORDER_SIZE"),
             ("bankroll", "BANKROLL"), ("max_daily_loss", "MAX_DAILY_LOSS"),
-            ("max_drawdown_pct", "MAX_DRAWDOWN_PERCENT"), ("profit_target", "PROFIT_TARGET")]:
+            ("max_drawdown_pct", "MAX_DRAWDOWN_PERCENT"), ("profit_target", "PROFIT_TARGET"),
+            ("dc_salvage_min_flip", "DC_SALVAGE_MIN_FLIP_PCT"),
+            ("dc_salvage_min_hold", "DC_SALVAGE_MIN_HOLD_S"),
+            ("max_entries_per_window", "MAX_ENTRIES_PER_WINDOW"),
+            ("reentry_cooldown", "REENTRY_COOLDOWN_SECONDS"),
+            ("reentry_size_decay", "REENTRY_SIZE_DECAY")]:
         val = getattr(args, arg_name)
         if val is not None:
             setg(glob_name, val)
@@ -1939,6 +2275,10 @@ def apply_cli_overrides(args: argparse.Namespace) -> List[str]:
         setg("MTF_COUNTER_TREND_BLOCK", args.counter_trend_block)
     if args.salvage is not None:
         setg("DC_SALVAGE_EXIT", args.salvage)
+    if args.reentry_same_side is not None:
+        setg("REENTRY_SAME_SIDE_ALLOWED", args.reentry_same_side)
+    if args.reentry_after_loss_only is not None:
+        setg("REENTRY_AFTER_LOSS_ONLY", args.reentry_after_loss_only)
     if args.force_paper:
         setg("FORCE_PAPER_MODE", True)
     if args.asset_overrides is not None:
@@ -1955,9 +2295,259 @@ def apply_cli_overrides(args: argparse.Namespace) -> List[str]:
     return applied
 
 
+# ============================================================================
+# INTERACTIVE CONFIG MENU (v0.6.0) — pure stdlib; edits the config file and
+# exits (never starts trading). Works with piped stdin; EOFError / Ctrl-C is
+# treated as exit-without-saving.
+# ============================================================================
+MENU_SECTIONS = [
+    ("Strategy & Assets", ["STRATEGY", "ASSETS", "FORCE_PAPER_MODE", "PRETTY_DISPLAY", "KALSHI_API_BASE"]),
+    ("Delta Capture core", ["DC_ENTRY_WINDOW_MIN", "DC_MIN_DELTA_PCT", "DC_MAX_DELTA_PCT",
+                            "DC_MAX_ENTRY_PRICE", "DC_STOCH_K_LONG_MIN", "DC_REQUIRE_K_GT_D",
+                            "DC_DEAD_ZONE", "DC_ATR_MAX_PCT", "DC_MAX_SPREAD_CENTS"]),
+    ("Scalp", ["DC_SCALP_ENABLED", "DC_SCALP_WINDOW_MIN", "DC_SCALP_MIN_MOVE_PCT",
+               "DC_SCALP_MAX_PRICE", "DC_SCALP_K_UP", "DC_SCALP_K_DOWN", "DC_SCALP_SIZE_MULT"]),
+    ("MTF momentum", ["MTF_ENABLED", "MTF_COUNTER_TREND_BLOCK", "MTF_MIN_SCORE", "MTF_STRONG_SCORE",
+                      "MTF_MIN_TRADE_SCORE", "MTF_TREND_MAX_DELTA_PCT", "MTF_TREND_MAX_PRICE",
+                      "MTF_TREND_SIZE_MULT"]),
+    ("Multi-Entry / Shots on Goal", ["MAX_ENTRIES_PER_WINDOW", "REENTRY_COOLDOWN_SECONDS",
+                                     "REENTRY_SIZE_DECAY", "REENTRY_SAME_SIDE_ALLOWED",
+                                     "REENTRY_AFTER_LOSS_ONLY"]),
+    ("Risk & Sizing", ["ORDER_SIZE", "MAX_ORDER_SIZE", "MAX_RISK_PER_TRADE_PCT", "BANKROLL",
+                       "MAX_DAILY_LOSS", "MAX_DRAWDOWN_PERCENT", "MAX_CONSECUTIVE_LOSSES",
+                       "PAUSE_AFTER_LOSS_STREAK_MIN", "POST_TRADE_COOLDOWN_SECONDS"]),
+    ("Exits & Salvage", ["DC_SALVAGE_EXIT", "DC_SALVAGE_MIN_MINUTES", "DC_SALVAGE_MIN_FLIP_PCT",
+                         "DC_SALVAGE_MIN_HOLD_S", "PROFIT_TARGET", "NO_ENTRY_FINAL_SECONDS"]),
+    ("Per-Asset Overrides", None),  # special JSON editor for ASSET_OVERRIDES
+]
+
+_MENU_PRICE_PARAMS = {"DC_MAX_ENTRY_PRICE", "DC_SCALP_MAX_PRICE", "MTF_TREND_MAX_PRICE", "PROFIT_TARGET"}
+_MENU_TUPLE_PARAMS = {"DC_ENTRY_WINDOW_MIN", "DC_DEAD_ZONE", "DC_SCALP_WINDOW_MIN"}
+
+
+def _menu_fmt(v) -> str:
+    return str(v)
+
+
+def _menu_parse_value(name: str, text: str, default):
+    """Parse user input according to the script default's type.
+    Returns (ok, value_or_error_message). Never raises."""
+    text = text.strip()
+    if isinstance(default, bool):
+        t = text.lower()
+        if t in ("y", "yes", "true", "1"):
+            return True, True
+        if t in ("n", "no", "false", "0"):
+            return True, False
+        return False, "enter y/n/true/false/1/0"
+    if isinstance(default, int):
+        try:
+            return True, int(text)
+        except ValueError:
+            return False, "enter an integer"
+    if isinstance(default, float):
+        try:
+            return True, float(text)
+        except ValueError:
+            return False, "enter a number"
+    if isinstance(default, str):
+        return (True, text) if text else (False, "empty value")
+    if isinstance(default, tuple):
+        parts = [p for p in text.replace(",", " ").split() if p]
+        if len(parts) != len(default):
+            return False, f"enter {len(default)} numbers ('lo hi' or 'lo,hi')"
+        try:
+            return True, tuple(type(d)(p) for d, p in zip(default, parts))
+        except (TypeError, ValueError):
+            return False, "invalid number"
+    if isinstance(default, list):
+        vals = [p.strip().upper() for p in text.split(",") if p.strip()]
+        return (True, vals) if vals else (False, "enter a comma-separated list")
+    if isinstance(default, dict):
+        try:
+            v = json.loads(text)
+        except json.JSONDecodeError as e:
+            return False, f"invalid JSON: {e}"
+        return (True, v) if isinstance(v, dict) else (False, "enter a JSON object")
+    return False, "unsupported type"
+
+
+def _menu_validate(name: str, value) -> Optional[str]:
+    """Range validation where obvious. Returns an error string or None."""
+    if name in _MENU_PRICE_PARAMS and not (0 < value < 1):
+        return "price must satisfy 0 < price < 1"
+    if name in _MENU_TUPLE_PARAMS and not (value[0] < value[1]):
+        return "need LO < HI"
+    if name == "STRATEGY" and value not in _STRATEGY_CHOICES:
+        return f"unknown strategy; valid: {_STRATEGY_CHOICES}"
+    if name == "ASSETS":
+        unknown = [a for a in value if a not in ASSET_SERIES_MAP]
+        if unknown:
+            return f"unknown asset(s) {unknown}; valid: {sorted(ASSET_SERIES_MAP)}"
+    if name == "MAX_ENTRIES_PER_WINDOW" and value < 1:
+        return "must be >= 1"
+    if name == "REENTRY_SIZE_DECAY" and not (0 < value <= 1):
+        return "decay must satisfy 0 < decay <= 1"
+    if name in ("REENTRY_COOLDOWN_SECONDS", "POST_TRADE_COOLDOWN_SECONDS",
+                "DC_SALVAGE_MIN_HOLD_S", "NO_ENTRY_FINAL_SECONDS") and value < 0:
+        return "must be >= 0"
+    return None
+
+
+def run_config_menu(cli_path: Optional[str]) -> Optional[str]:
+    """Terminal menu that edits the JSON config file and exits. Returns the path
+    written on save, None otherwise."""
+    if cli_path:
+        path = cli_path
+    else:
+        path = find_config_file(None) or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE_DEFAULT)
+
+    # Effective values = script defaults + existing config file (coerced).
+    values = copy.deepcopy(_SCRIPT_DEFAULTS)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k.startswith("_"):
+                        continue
+                    kk = "MAX_ENTRIES_PER_WINDOW" if k == "MAX_TRADES_PER_SESSION" else k
+                    if kk in values:
+                        ok, cv = _coerce_config_value(v, values[kk])
+                        if ok:
+                            values[kk] = cv
+        except Exception as e:
+            print(f"Warning: could not read {path}: {e}")
+
+    def edit_section(title: str, names: List[str]):
+        while True:
+            print(f"\n--- {title} ---")
+            for i, name in enumerate(names, 1):
+                print(f"  {i}) {name} = {_menu_fmt(values[name])} "
+                      f"(default: {_menu_fmt(_SCRIPT_DEFAULTS[name])})")
+            print("  b) back")
+            sel = input("Select parameter: ").strip().lower()
+            if sel == "b":
+                return
+            if not sel.isdigit() or not (1 <= int(sel) <= len(names)):
+                print("Invalid choice.")
+                continue
+            name = names[int(sel) - 1]
+            while True:
+                raw = input(f"New value for {name} (empty = cancel, r = reset to default): ").strip()
+                if raw == "":
+                    break
+                if raw.lower() == "r":
+                    values[name] = copy.deepcopy(_SCRIPT_DEFAULTS[name])
+                    print(f"{name} reset to default {_menu_fmt(_SCRIPT_DEFAULTS[name])}")
+                    break
+                ok, v = _menu_parse_value(name, raw, _SCRIPT_DEFAULTS[name])
+                if not ok:
+                    print(f"Invalid: {v}")
+                    continue
+                err = _menu_validate(name, v)
+                if err:
+                    print(f"Invalid: {err}")
+                    continue
+                values[name] = v
+                print(f"{name} = {_menu_fmt(v)}")
+                break
+            return  # back to the main menu after each edit
+
+    def edit_overrides():
+        while True:
+            print("\n--- Per-Asset Overrides (ASSET_OVERRIDES) ---")
+            ov = values["ASSET_OVERRIDES"]
+            assets = sorted(set(ASSET_SERIES_MAP) | set(ov))
+            for i, a in enumerate(assets, 1):
+                print(f"  {i}) {a} = {json.dumps(ov.get(a, {}))}")
+            print("  b) back")
+            sel = input("Select asset (number or symbol): ").strip()
+            if sel.lower() == "b":
+                return
+            if sel.isdigit() and 1 <= int(sel) <= len(assets):
+                asset = assets[int(sel) - 1]
+            else:
+                asset = sel.upper()
+                if asset not in ASSET_SERIES_MAP:
+                    print(f"Unknown asset {asset!r}. Valid: {sorted(ASSET_SERIES_MAP)}")
+                    continue
+            while True:
+                raw = input(f"JSON overrides for {asset} (empty = cancel, r = remove): ").strip()
+                if raw == "":
+                    break
+                if raw.lower() == "r":
+                    ov.pop(asset, None)
+                    print(f"{asset} overrides removed")
+                    break
+                try:
+                    v = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    print(f"Invalid JSON: {e}")
+                    continue
+                if not isinstance(v, dict):
+                    print('Must be a JSON object, e.g. {"DC_ATR_MAX_PCT": 0.001}')
+                    continue
+                bad = [k for k in v if k not in CONFIG_SETTABLE or k == "ASSET_OVERRIDES"]
+                if bad:
+                    print(f"Unknown param(s) {bad}")
+                    continue
+                ov[asset] = v
+                print(f"{asset} = {json.dumps(v)}")
+                break
+            return  # back to the main menu after each edit
+
+    def save() -> str:
+        diff = {"_comment": "kalshi-trading-bot config file. Precedence: script defaults < "
+                            "this file < CLI flags. Only values that differ from the script "
+                            "defaults are stored here. Edit via: python3 kalshi_trading_bot.py --menu"}
+        for name in sorted(values):
+            if values[name] != _SCRIPT_DEFAULTS[name]:
+                diff[name] = values[name]
+        with open(path, "w") as f:
+            json.dump(diff, f, indent=2)
+            f.write("\n")
+        print(f"Saved {path} ({len(diff) - 1} override(s))")
+        return path
+
+    try:
+        while True:
+            print("\n=== kalshi-trading-bot v0.6.0 — config editor ===")
+            print(f"Target config file: {path}")
+            for i, (title, _) in enumerate(MENU_SECTIONS, 1):
+                print(f"  {i}) {title}")
+            print("  9) Save & exit")
+            print("  0) Exit without saving")
+            choice = input("Select section: ").strip().lower()
+            if choice == "9":
+                return save()
+            if choice == "0":
+                print("Exiting without saving.")
+                return None
+            if choice.isdigit() and 1 <= int(choice) <= len(MENU_SECTIONS):
+                title, names = MENU_SECTIONS[int(choice) - 1]
+                if names is None:
+                    edit_overrides()
+                else:
+                    edit_section(title, names)
+            else:
+                print("Invalid choice.")
+    except (EOFError, KeyboardInterrupt):
+        print("\nExiting without saving.")
+        return None
+
+
 def main():
-    global PRETTY_DISPLAY
+    global PRETTY_DISPLAY, CONFIG_FILE_USED
     args = build_arg_parser().parse_args()
+    if args.menu:
+        run_config_menu(args.config_file)
+        return
+    # Precedence: script defaults < config file < CLI flags.
+    cfg_path, cfg_applied, cfg_messages = load_config_file(find_config_file(args.config_file))
+    CONFIG_FILE_USED = cfg_path
     cli_overrides = apply_cli_overrides(args)  # sets module globals pre-construction
     if args.pretty:
         PRETTY_DISPLAY = True
@@ -1965,6 +2555,10 @@ def main():
 
     logger, log_file, trade_file, perf_file = setup_logging(pretty_display=PRETTY_DISPLAY)
     logger.info(f"Log: {log_file} | Trades: {trade_file} | Perf: {perf_file}")
+    for level, msg in cfg_messages:
+        logger.log(level, msg)
+    if cfg_applied:
+        logger.info(f"Config file ({cfg_path}): {' | '.join(cfg_applied)}")
     if cli_overrides:
         logger.info(f"CLI override: {' | '.join(cli_overrides)}")
 
